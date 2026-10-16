@@ -361,6 +361,7 @@ export function createEngineSession(options: EngineSessionOptions): TargetSessio
         {
           ...(observeOptions?.pixels === true ? { pixels: true } : {}),
           ...(observeOptions?.pixelFallback === true ? { pixelFallback: true } : {}),
+          ...(observeOptions?.comparable === true ? { comparable: true } : {}),
         },
       );
       const minted = `${OBSERVE_REVISION_PREFIX}${revision + 1}`;
@@ -394,6 +395,7 @@ export function createEngineSession(options: EngineSessionOptions): TargetSessio
         kind: 'semantic',
         tree: stampRevision(snapshot.root, minted),
         truncated: snapshot.truncated === true,
+        ...(snapshot.keyboardVisible === undefined ? {} : { keyboardVisible: snapshot.keyboardVisible }),
         ...(snapshot.pixels === undefined ? {} : { pixels: snapshot.pixels }),
       };
       showScreen(observation);

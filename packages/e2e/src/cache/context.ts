@@ -5,12 +5,14 @@
  * resolved store, key derivation over the attempt's fixed identity, and the
  * staging ground for trace writes. Replay is eligible only on a first attempt
  * — a retry exists because something already went wrong, so it runs fresh and
- * re-records.
+ * re-records — unless `cache.strict` is on. A strict run treats the store as
+ * the reviewed source of truth: every attempt replays, and nothing is written
+ * or evicted, whatever the configured mode.
  */
 
-import path from 'node:path';
 import type { CacheStrictSource, ResolvedCacheConfig } from '../config/resolve.ts';
 import { canonicalJson } from '../internal/ids.ts';
+import { displayPath, insideProjectRoot } from '../internal/paths.ts';
 import { REPLAY_POLICY_VERSION } from './relocate.ts';
 import {
   buildTraceCacheKey,
@@ -60,6 +62,7 @@ export interface ClaimedKey {
 }
 
 export interface AgentCacheContext {
+  /** The configured mode, except that `cache.strict` is always `read-only`. */
   readonly mode: 'read-only' | 'read-write';
   readonly store: CacheStore;
   /** Whether this attempt may replay; writes are governed by `mode` alone. */
@@ -125,7 +128,7 @@ async function holdsSameFlow(store: CacheStore, keyHash: string, trace: ActionTr
 
 /** The part of a trace that decides what a replay does, as canonical JSON. */
 function flowOf(trace: ActionTrace): string {
-  const { summary: _summary, endWaitMs: _endWaitMs, keyedBy: _keyedBy, actions, ...flow } = trace;
+  const { summary: _summary, endWaitMs: _endWaitMs, keyedBy: _keyedBy, recordedBy: _recordedBy, actions, ...flow } = trace;
   return canonicalJson({
     ...flow,
     actions: actions.map((action) => {
@@ -236,8 +239,9 @@ export function createAgentCacheContext(options: {
   /** The file store's listing under `cache.strict`, shared by the attempts of one worker and target (`storedRecordingsFor`). */
   readonly recordings?: StoredRecordings | undefined;
 }): AgentCacheContext | undefined {
-  const mode = options.cache.mode;
-  if (mode === 'off') return undefined;
+  if (options.cache.mode === 'off') return undefined;
+  const strict = options.cache.strict !== false;
+  const mode = strict ? 'read-only' : options.cache.mode;
   const store =
     options.cache.store ??
     new FileCacheStore({
@@ -259,7 +263,7 @@ export function createAgentCacheContext(options: {
   return {
     mode,
     store,
-    replayEligible: options.attemptIndex === 0,
+    replayEligible: strict || options.attemptIndex === 0,
     strict:
       options.cache.strict === false
         ? false
@@ -308,7 +312,8 @@ function staleAdvice(cache: ResolvedCacheConfig, source: CacheStrictSource, proj
   ].join(' and ');
   const run = `re-record it with a read-write run ${off}`;
   if (cache.store !== undefined) return `${run}; the run writes the new entry to the configured cache.store`;
-  const relative = path.relative(projectRoot, cache.dir);
-  const where = relative === '' || relative.startsWith('..') || path.isAbsolute(relative) ? cache.dir : relative;
-  return `${run} and commit the changed entry under ${where.split(path.sep).join('/')}`;
+  const where = displayPath(projectRoot, cache.dir);
+  return insideProjectRoot(projectRoot, cache.dir)
+    ? `${run} and commit the changed entry under ${where}`
+    : `${run}; the run writes the new entry under ${where}`;
 }

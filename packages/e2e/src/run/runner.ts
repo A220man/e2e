@@ -12,7 +12,16 @@ import {
 } from '../config/resolve.ts';
 import { collect, collectInMemory, collectSetups, type Collection } from '../collect/collect.ts';
 import type { ModuleRegistration } from '../collect/registry.ts';
-import { repeatEach, select, selectTargets, type Selection, type SelectionFilters, type Shard, type TagMode } from '../collect/select.ts';
+import {
+  repeatEach,
+  select,
+  selectTargets,
+  type Selection,
+  type SelectionFilters,
+  type Shard,
+  type TagMode,
+  type TestTargetPair,
+} from '../collect/select.ts';
 import {
   classifyError,
   combineExitCodes,
@@ -26,9 +35,9 @@ import {
 import { loadAiSdk } from '../agent/ai-sdk.ts';
 import { AiTraceCollector, AiTraceRecorder, registerAiTraceRecorder } from '../internal/ai-trace.ts';
 import { DebugTrace } from '../internal/debug.ts';
-import { timestamp, uuidv7 } from '../internal/ids.ts';
+import { resultId, timestamp, uuidv7 } from '../internal/ids.ts';
 import type { ExploreProgress } from '../explore/progress.ts';
-import { buildReport, type Report1Document, type ReportExplore, type TargetProvenance } from '../report/build.ts';
+import { buildReport, projectSource, type Report1Document, type ReportExplore, type TargetProvenance } from '../report/build.ts';
 import { agentStepTable } from '../report/debug-steps.ts';
 import { writeTracePages, type TracePages } from '../report/traces.ts';
 import { STATELESS_REPORTERS } from '../report/builtin.ts';
@@ -39,19 +48,19 @@ import { allocateAppPorts } from './app-ports.ts';
 import { inProcessSpawner } from './in-process.ts';
 import { someSkippedAfterFailure, tracedResultIds, type ResultRecord, type RunError, type SerialGroupRecord } from './records.ts';
 import { runUnits } from './scheduler.ts';
-import { buildWorkPlans, plannedSlots, type TargetWorkPlan } from './units.ts';
+import { buildWorkPlans, longestFirst, plannedSlots, type TargetWorkPlan, type TimeLimit } from './units.ts';
 import { SessionStore } from './sessions.ts';
 import { outputLayout } from './output.ts';
 import type { RunnerOutput } from './process-output.ts';
 import { registerStaticSecrets } from './secrecy.ts';
 import { nextRerunDir, pruneArtifacts } from './artifacts.ts';
-import { carryForward, lastFailedIds, readLastRun, reportArtifactPaths, type RerunCollection } from './last-run.ts';
+import { carryForward, fileDurationKey, lastFailedIds, previousFileDurations, readLastRun, reportArtifactPaths, type RerunCollection } from './last-run.ts';
 import { childProcessSpawner } from './worker/handle.ts';
 import { setSecretRegistry } from '../secrets.ts';
 import { withAbort } from '../internal/time.ts';
 import type { BuiltinReporter, E2EConfig, FinishedRun, RecordingMode, Reporter, ReporterSummary } from '../types.ts';
 import { modelLabel } from '../config/agent.ts';
-import { positiveInt } from '../config/validate.ts';
+import { positiveInt, timerMs } from '../config/validate.ts';
 import { detectVcs, type VcsInfo } from '../internal/vcs.ts';
 import type { EnginePrepareResult } from '../engine/index.ts';
 import type { AppProcesses } from './managed-process.ts';
@@ -78,6 +87,14 @@ export interface RunOptions {
    * `NO_LAST_RUN`; a run with nothing failed selects nothing.
    */
   lastFailed?: boolean | undefined;
+  /**
+   * Evaluates the project's own files afresh for this run, not only the
+   * config and the test files: the helpers they import too, one copy shared
+   * by the whole run. For a loop that runs again in one process after a
+   * save (`--watch`); each such run keeps its copy for the life of the
+   * process.
+   */
+  freshGraph?: boolean | undefined;
   /** One shard of the selection, cut once every other filter applied (`--shard 2/3`). */
   shard?: Shard | undefined;
   targetIds?: readonly string[] | undefined;
@@ -90,6 +107,13 @@ export interface RunOptions {
    * `failure-limit`, and the exit code is the failures' own.
    */
   maxFailures?: number | undefined;
+  /**
+   * Stops the run once it has spent this many milliseconds running tests
+   * (`--max-duration`), over the config's `maxDuration`: the tests running
+   * end as interrupted, the rest are skipped with cause `time-limit`, the
+   * run records a `RUN_TIMEOUT` error, and the exit code is 1.
+   */
+  maxDuration?: number | undefined;
   /**
    * Runs every selected test this many times (`--repeat-each`), each run a
    * result of its own with `repeat` 0 through `n - 1`. Setup tests run once.
@@ -108,8 +132,15 @@ export interface RunOptions {
   passWithNoTests?: boolean | undefined;
   /** Runs with the trace cache off (`--no-cache`), overriding the config. */
   noCache?: boolean | undefined;
+  /**
+   * The replay cache directory for this run (`--cache-dir`), relative to the
+   * project root, over `E2E_CACHE_DIR` and the config's `cache.dir`.
+   */
+  cacheDir?: string | undefined;
   /** Turns `cache.strict` on (`--strict-cache`): a recording that no longer replays fails its step. */
   strictCache?: boolean | undefined;
+  /** Rewrites the stored screenshots `toHaveScreenshot` finds different (`--update-snapshots`). */
+  updateSnapshots?: boolean | undefined;
   /**
    * The configured agents unpinned tests run as (`--agent`), instead of
    * `agents.default`. Several names run every such test once per agent.
@@ -207,72 +238,109 @@ function consumesSession(registration: ModuleRegistration): boolean {
 /** How long a reporter's `onRunFinished` may take before the run stops waiting for it. */
 const REPORTER_TIMEOUT_MS = 60_000;
 
-/** The selection flags of `run`, without anything that would start a process. */
-export type ListOptions = Pick<
-  RunOptions,
-  | 'cwd'
-  | 'configPath'
-  | 'files'
-  | 'tags'
-  | 'tagMode'
-  | 'excludeTags'
-  | 'grep'
-  | 'grepInvert'
-  | 'lastFailed'
-  | 'shard'
-  | 'targetIds'
-  | 'passWithNoTests'
-  | 'output'
-  | 'rawConfig'
-  | 'env'
->;
+/**
+ * What `list` selects on. `config` is a path or a config value (omit it to
+ * discover `e2e.config.ts`); `targets` are target names. The rest are the
+ * selection flags `run` takes, under the same names.
+ */
+export interface ListOptions
+  extends Pick<
+    RunOptions,
+    | 'cwd'
+    | 'files'
+    | 'tags'
+    | 'tagMode'
+    | 'excludeTags'
+    | 'grep'
+    | 'grepInvert'
+    | 'lastFailed'
+    | 'shard'
+    | 'passWithNoTests'
+    | 'output'
+    | 'env'
+  >
+{
+  /**
+   * A config file path, or a config value in place of a discovered file.
+   * Omit it to discover `e2e.config.ts` from `cwd`.
+   */
+  config?: string | E2EConfig | undefined;
+  /** Target names (`--target`). An unknown name is `UNKNOWN_TARGET`. */
+  targets?: readonly string[] | undefined;
+}
 
-/** One test-target pair the runner would report, as `e2e list` prints it. */
+/**
+ * One test, target, and agent the selection produced, filtered pairs
+ * included. `id` is the result id `report.json` stores for repeat 0.
+ * `source`, `session`, and `serialId` are present and `undefined` when the
+ * test has none; `reason` is omitted unless the pair is skipped or filtered.
+ */
 export interface ListedPair {
+  readonly id: string;
   readonly file: string;
   readonly title: string;
   readonly titlePath: readonly string[];
   readonly kind: 'test' | 'setup';
   /** The tags the test declares; `[]` when none. */
   readonly tags: readonly string[];
+  /** The declaration, project-relative. `undefined` when the test recorded none. */
+  readonly source: { readonly file: string; readonly line: number; readonly column: number } | undefined;
+  /** The session the test consumes, from the test or its describe chain. */
+  readonly session: string | undefined;
+  /** Session names a setup produces; `[]` on an ordinary test. */
+  readonly sessions: readonly string[];
+  /** Set when the test belongs to a serial group. */
+  readonly serialId: string | undefined;
   readonly target: string;
-  readonly disposition: 'run' | 'skip';
-  readonly skipReason?: string;
+  /** The configured agent this pair runs as. */
+  readonly agent: string;
+  readonly disposition: 'run' | 'skip' | 'filtered';
+  /** Why the pair is skipped or filtered; omitted when it runs. */
+  readonly reason?: string;
+}
+
+/** The selection `list` returns. */
+export interface ListResult {
+  /** One pair per test, target, and agent, in selection order, filtered pairs included. */
+  readonly pairs: readonly ListedPair[];
+  /** Positional arguments, as written, that selected no discovered file. */
+  readonly unmatched: readonly string[];
+  /** Selected target names, in config order. */
+  readonly targets: readonly string[];
 }
 
 /**
- * Collects and selects like `run` and stops there: no app process, no engine
- * prepare, no worker. The pairs are the ones `run` would report, in report
- * order; pairs the selection filtered out are left out, as the list reporter
- * leaves them out. Config, collection, and selection failures throw the same
- * classified error `run` would record.
+ * Collects and selects like `e2e list` and stops there: no app process, no
+ * engine prepare, no worker. Every pair is returned, filtered ones included,
+ * in selection order, one per test, target, and agent; repeats are not
+ * expanded. `unmatched` is the positional arguments that selected no file,
+ * `targets` the selected target names in config order. An empty selection
+ * throws `NO_TESTS` unless `passWithNoTests`. Config, collection, and
+ * selection failures throw the same classified error `run` records. Each
+ * call imports the test files again, so a later call sees an edit.
  */
-export async function list(options: ListOptions = {}): Promise<{ pairs: ListedPair[] }> {
+export async function list(options: ListOptions = {}): Promise<ListResult> {
   const cwd = options.cwd ?? process.cwd();
   const env = options.env ?? process.env;
-  const config = await loadRunConfig(options, cwd, env, options.output === undefined ? {} : { output: options.output });
-  const collection = await collect(config, options.files);
+  const runOptions = toSelectionRunOptions(options);
+  const config = await loadRunConfig(
+    runOptions,
+    cwd,
+    env,
+    runOptions.output === undefined ? {} : { output: runOptions.output },
+  );
+  const collection = await collect(config, runOptions.files);
   const selection = select(
     collection,
     config,
-    (await selectionInputs(options, config)).filters,
-    options.passWithNoTests !== undefined ? { passWithNoTests: options.passWithNoTests } : {},
+    (await selectionInputs(runOptions, config)).filters,
+    runOptions.passWithNoTests !== undefined ? { passWithNoTests: runOptions.passWithNoTests } : {},
   );
-  const pairs: ListedPair[] = [];
-  for (const pair of selection.pairs) {
-    if (pair.disposition === 'filtered') continue;
-    pairs.push({
-      file: pair.test.file,
-      title: pair.test.title,
-      titlePath: pair.test.titlePath,
-      kind: pair.test.kind,
-      tags: pair.test.tags,
-      target: pair.target.name,
-      disposition: pair.disposition,
-      ...(pair.skip === undefined ? {} : { skipReason: pair.skip.reason }),
-    });
-  }
-  return { pairs };
+  return {
+    pairs: selection.pairs.map((pair) => toListedPair(config.projectRoot, pair)),
+    unmatched: collection.unmatchedPositionals,
+    targets: selection.perTarget.map((entry) => entry.target.name),
+  };
 }
 
 export interface RunOutcome {
@@ -300,6 +368,8 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
   const cwd = options.cwd ?? process.cwd();
   const env = options.env ?? process.env;
   const runId = uuidv7();
+  /** The fresh module graph this run's config and test files load in, when `freshGraph` asks for one. */
+  const graph = options.freshGraph === true ? `run-${runId}` : undefined;
   /**
    * When the run began executing: taken again right before `plan`, once
    * collection and provisioning are done, so a first-run download is never
@@ -332,7 +402,9 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
   if (options.reporters !== undefined) cli.reporters = options.reporters;
   if (options.noCache === true) cli.cache = 'off';
   if (options.strictCache === true) cli.cacheStrict = true;
+  if (options.updateSnapshots === true) cli.updateSnapshots = true;
   if (options.output !== undefined) cli.output = options.output;
+  if (options.cacheDir !== undefined) cli.cacheDir = options.cacheDir;
   if (options.trace !== undefined) cli.trace = options.trace;
   if (options.video !== undefined) cli.video = options.video;
   if (options.agent !== undefined) cli.agents = typeof options.agent === 'string' ? [options.agent] : options.agent;
@@ -349,7 +421,7 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
   // The config's secrets are known to the process before what its top-level
   // code printed is released, so that output is redacted like any other.
   const loadConfig = async (): Promise<ResolvedConfig> => {
-    const config = await loadRunConfig(options, cwd, env, cli);
+    const config = await loadRunConfig(options, cwd, env, cli, graph);
     registerStaticSecrets(config.allSecrets);
     return allocateAppPorts(config);
   };
@@ -411,9 +483,10 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
   };
 
   /**
-   * The failure limit was reached: the scheduler has stopped dispatching and
-   * interrupted its workers on its own. What it cut short is interrupted,
-   * but the run is not: the exit code is the failures', never 130.
+   * The failure or time limit was reached: the scheduler has stopped
+   * dispatching and interrupted its workers on its own. What it cut short is
+   * interrupted, but the run is not: the exit code is the failures' or
+   * `RUN_TIMEOUT`'s, never 130.
    */
   let stoppedEarly = false;
   const stopEarly = (failures: number, limit: number): void => {
@@ -671,7 +744,7 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
         debug.time('collect', async () => {
           const collection =
             options.tests === undefined
-              ? await collect(config, options.files)
+              ? await collect(config, options.files, graph)
               : collectInMemory(
                   config.projectRoot,
                   options.tests.file,
@@ -731,6 +804,16 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
     const workerConfigPath = options.tests === undefined ? config.configPath : undefined;
     const inProcess = workerConfigPath === undefined;
     const runWorkers = inProcess ? 1 : config.workers;
+    if (runWorkers > 1) {
+      const previous = await previousFileDurations(outputLayout(config.output).report);
+      plans = longestFirst(plans, (targetName, file) => previous.get(fileDurationKey(targetName, file)));
+    }
+    const timeLimit: TimeLimit | undefined =
+      options.maxDuration !== undefined
+        ? { ms: options.maxDuration, source: '--max-duration' }
+        : config.maxDuration === undefined
+          ? undefined
+          : { ms: config.maxDuration, source: 'maxDuration' };
 
     // Provisioning: an engine that must fetch something onto this machine (a
     // first-run browser download) does it here, once per target, before the
@@ -762,6 +845,7 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
     // as a run notice.
     const processHooks = () => ({
       ci: isCiMode(env),
+      env,
       notice: (message: string) => emit({ type: 'notice', target: 'app', message }),
       starting: (label: string) => emit({ type: 'setup', step: { kind: 'app', label }, state: 'started' }),
       ready: (label: string, durationMs: number, reused: boolean) =>
@@ -855,6 +939,7 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
         plans,
         workers: runWorkers,
         ...(options.maxFailures === undefined ? {} : { maxFailures: options.maxFailures }),
+        ...(timeLimit === undefined ? {} : { timeLimit }),
         spawn,
         interruptGraceMs: config.timeout + config.cleanupTimeout,
         interruptSignal: interrupted,
@@ -872,6 +957,9 @@ export async function run(options: RunOptions = {}): Promise<RunOutcome> {
           onRunError: recordRunError,
           onRunAbort: abortRun,
           onFailureLimit: stopEarly,
+          onTimeLimit: () => {
+            stoppedEarly = true;
+          },
           onTestStart: (start, targetName) =>
             emit({ type: 'test-started', ...start, target: targetName }),
           onProgress: (pair, targetName, progress) =>
@@ -1019,12 +1107,69 @@ interface SelectionInputs {
 }
 
 /**
+ * What `loadRunConfig`, `selectionInputs`, and `validateRunOptions` read.
+ * `run` passes `RunOptions`; `list` translates the public bag into these
+ * (`config` string to `configPath`, object to `rawConfig`, `targets` to `targetIds`).
+ */
+type SelectionRunOptions = Pick<
+  RunOptions,
+  | 'configPath'
+  | 'rawConfig'
+  | 'files'
+  | 'tags'
+  | 'tagMode'
+  | 'excludeTags'
+  | 'grep'
+  | 'grepInvert'
+  | 'lastFailed'
+  | 'freshGraph'
+  | 'shard'
+  | 'targetIds'
+  | 'passWithNoTests'
+  | 'output'
+  | 'maxFailures'
+  | 'maxDuration'
+  | 'repeatEach'
+>;
+
+/** The public `list` bag as the options config loading and selection already take. */
+export function toSelectionRunOptions(options: ListOptions): SelectionRunOptions {
+  const { config, targets, ...rest } = options;
+  return {
+    ...rest,
+    ...(typeof config === 'string' ? { configPath: config } : {}),
+    ...(config !== undefined && typeof config !== 'string' ? { rawConfig: config } : {}),
+    ...(targets !== undefined ? { targetIds: targets } : {}),
+  };
+}
+
+/** One collected pair as `list` reports it: the report's result id at repeat 0, project-relative source. */
+function toListedPair(projectRoot: string, pair: TestTargetPair): ListedPair {
+  return {
+    id: resultId(pair.test.id, pair.target.name, pair.agent),
+    file: pair.test.file,
+    title: pair.test.title,
+    titlePath: pair.test.titlePath,
+    kind: pair.test.kind,
+    tags: pair.test.tags,
+    source: projectSource(projectRoot, pair.test.source, pair.test.file),
+    session: pair.options.session,
+    sessions: pair.test.sessions,
+    serialId: pair.test.serialId,
+    target: pair.target.name,
+    agent: pair.agent,
+    disposition: pair.disposition,
+    ...(pair.skip === undefined ? {} : { reason: pair.skip.reason }),
+  };
+}
+
+/**
  * The selection filters the options ask for. `--last-failed` reads the
  * previous run's report here, before collection is judged, so a missing
  * report is a collection-phase failure like any other selection error; the
  * report itself reaches the reporters as `FinishedRun.lastRun`.
  */
-async function selectionInputs(options: ListOptions, config: ResolvedConfig): Promise<SelectionInputs> {
+async function selectionInputs(options: SelectionRunOptions, config: ResolvedConfig): Promise<SelectionInputs> {
   const lastRun =
     options.lastFailed === true ? await readLastRun(outputLayout(config.output).report) : undefined;
   const filters: SelectionFilters = {
@@ -1046,18 +1191,19 @@ async function selectionInputs(options: ListOptions, config: ResolvedConfig): Pr
  * `INVALID_CONFIG` rather than a run that stops at its first failure or
  * runs each test once.
  */
-function validateRunOptions(options: ListOptions): void {
-  const given = options as RunOptions;
-  positiveInt(given.maxFailures, 'maxFailures');
-  positiveInt(given.repeatEach, 'repeatEach');
+function validateRunOptions(options: SelectionRunOptions): void {
+  positiveInt(options.maxFailures, 'maxFailures');
+  timerMs(options.maxDuration, 'maxDuration');
+  positiveInt(options.repeatEach, 'repeatEach');
 }
 
 /** Resolves the run's config: a supplied value, or the discovered file. */
 async function loadRunConfig(
-  options: ListOptions,
+  options: SelectionRunOptions,
   cwd: string,
   env: NodeJS.ProcessEnv,
   cli: CliOverrides,
+  graph?: string,
 ): Promise<ResolvedConfig> {
   validateRunOptions(options);
   if (options.rawConfig !== undefined) {
@@ -1067,7 +1213,7 @@ async function loadRunConfig(
   // A run with no config file has nothing to run against: `targets` is
   // required, so resolving an empty config would only report that symptom.
   if (discovered.configPath === undefined) throw missingConfigError(cwd);
-  const raw = await loadConfigModule(discovered.configPath);
+  const raw = await loadConfigModule(discovered.configPath, { graph });
   return resolveConfig(raw, {
     projectRoot: discovered.projectRoot,
     configPath: discovered.configPath,

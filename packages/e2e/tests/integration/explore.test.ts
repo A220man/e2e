@@ -126,6 +126,24 @@ describe('e2e explore', () => {
     expect(paths.map((entry) => entry!.split('/').at(-1)).toSorted()).toEqual(['finding-1.png', 'finding-2.png']);
   });
 
+  it('keeps its own timeout and ignores the config\'s maxDuration', async () => {
+    const model = installExploreModel({
+      plan: () => ({ decision: 'finish', summary: 'Nothing to report.' }),
+      loop: () => [{ toolName: 'complete_step', input: { status: 'passed', summary: 'Looked' } }],
+    });
+    const outcome = await runExplore(project, app, model, {
+      rawConfig: {
+        targets: [{ name: 'web', engine: web(), app: { url: app.url } }] as never,
+        agents: { default: { model } },
+        actionTimeout: 10_000,
+        maxDuration: 1,
+      },
+    });
+    expect(outcome.report.run.errors).toEqual([]);
+    expect(outcome.report.run.summary).toMatchObject({ interrupted: 0, skipped: 0 });
+    expect(outcome.report.run.explore).toMatchObject({ ended: 'finished', summary: 'Nothing to report.' });
+  });
+
   it('plans steps, records the finding with its evidence, and fails the run for the issue', async () => {
     const planPrompts: string[] = [];
     const model = installExploreModel({

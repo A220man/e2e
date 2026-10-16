@@ -13,11 +13,13 @@ import type {
   EngineAttemptContext,
   EngineHandle,
   EngineInitInfo,
+  EngineObserveOptions,
   EngineState,
   LocatorAction,
   LocatorActionKind,
   LocatorExpression,
   NodeRef,
+  ObservationPixels,
   OperationContext,
   PointerAction,
   PointerActionKind,
@@ -107,6 +109,11 @@ export interface FakeEngineBehavior {
   observe?(operation: OperationContext, attemptIndex: number): void | Promise<void>;
   /** Overrides the observed tree; default is one Submit button. A scene replaces it. */
   tree?: SemanticNode;
+  /** Pixels an observation that asks for them returns, with the regions masked in them; none when it returns undefined. */
+  pixels?(
+    options: EngineObserveOptions,
+    attemptIndex: number,
+  ): { readonly pixels: ObservationPixels; readonly maskedRegionCount?: number } | undefined;
   /**
    * A scripted screen, built once per attempt with a stage for timed
    * mutations: `observe` reports it, `locate` resolves over it with the
@@ -273,14 +280,16 @@ export function createFakeEngine(behavior: FakeEngineBehavior = {}): FakeEngineH
       events.push('dispose');
       await behavior.onDispose?.();
     },
-    async observe(operation) {
+    async observe(operation, options) {
       record('observe', operation);
       await behavior.observe?.(operation, current);
       const scene = sceneOf(operation);
+      const captured = options?.pixels === true ? behavior.pixels?.(options, current) : undefined;
       return {
         location: scene?.location ?? location,
         root: scene?.root() ?? tree,
         viewport: FAKE_VIEWPORT,
+        ...(captured === undefined ? {} : { pixels: captured.pixels, maskedRegionCount: captured.maskedRegionCount ?? 0 }),
       };
     },
     actions: behavior.actions ?? LOCATOR_ACTION_KINDS.filter((kind) => kind !== 'swipe'),
@@ -392,6 +401,9 @@ export function createFakeEngine(behavior: FakeEngineBehavior = {}): FakeEngineH
               },
               describe(): string {
                 return `gadget on ${context.targetName}`;
+              },
+              frame() {
+                return context.screen((expression) => ({ kind: 'frame', selector: '#pay', source: expression }));
               },
               broken(): never {
                 throw new Error('accessor broke');

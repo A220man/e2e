@@ -11,3 +11,6 @@
 .e2e/explore-*/
 # Side-by-side measurement runs (`--output .e2e-<label>`).
 .e2e-*/
+# Verification skill scratch: bug-bash charter output and proofs kept past the next run.
+.e2e/bugbash/
+.e2e/proof/

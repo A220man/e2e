@@ -100,6 +100,9 @@ describe.each<BrowserProviderScope>(['worker', 'attempt'])('downloads through a 
     const file = await browser.waitForDownload(() => page.locator('#download').click());
 
     expect(file.suggestedFilename).toBe('report.txt');
+    expect(path.isAbsolute(file.absolutePath)).toBe(true);
+    expect(file.absolutePath).toBe(path.join(artifactsDir, file.path));
+    expect(readFileSync(file.absolutePath, 'utf8')).toBe('report body');
     expect(file.path).toMatch(/^downloads\/\d{3}-report\.txt$/);
     expect(readFileSync(path.join(artifactsDir, file.path), 'utf8')).toBe('report body');
     expect(attached).toEqual([file.path]);

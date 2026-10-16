@@ -16,9 +16,13 @@
  * `undefined`, never as a repaired or partially trusted entry.
  */
 
+import { isKeyModifier, KEY_MODIFIERS, type KeyModifier } from '../engine/contract.ts';
 import { timestamp } from '../internal/ids.ts';
 import type { ScrollDirection } from '../types.ts';
 import { bound } from '../internal/text.ts';
+import { readBoundedText, readRecordedModel, type RecordedModel } from './trace-fields.ts';
+
+export type { RecordedModel } from './trace-fields.ts';
 
 export const TRACE_SCHEMA_VERSION = 'trace-1';
 
@@ -175,6 +179,12 @@ export type NodeActionName = (typeof NODE_ACTION_NAMES)[number];
 
 const isNodeActionName = oneOf(NODE_ACTION_NAMES);
 
+/** The node verbs that click: the only ones that may hold key modifiers. */
+const TAP_ACTION_NAMES = ['tap', 'doubleTap', 'secondaryTap'] as const satisfies readonly NodeActionName[];
+
+/** Whether a node verb clicks, so it may carry `modifiers`. */
+export const isTapActionName = oneOf(TAP_ACTION_NAMES);
+
 /**
  * Whether an action is one of the node verbs. The every-layer switches over
  * an action union (prose, recording, templating, replay) take these six
@@ -187,6 +197,8 @@ export function isNodeAction<A extends { readonly name: string }>(action: A): ac
 export interface NodeAction extends ActionBase {
   readonly name: NodeActionName;
   readonly target: TraceTargetDescriptor;
+  /** Keys a tap-family action held for the click; replayed with the action. */
+  readonly modifiers?: readonly KeyModifier[];
 }
 
 export interface TypeAction extends ActionBase {
@@ -371,6 +383,8 @@ export interface ActionTrace {
   readonly executor: { readonly name: string; readonly version?: string };
   /** Which test, target, and instruction recorded it; absent on older entries. */
   readonly recordedFor?: TraceProvenance;
+  /** Configured model when recorded; absent on older or unattributed entries. */
+  readonly recordedBy?: RecordedModel;
   /** The recorded run's verdict summary. */
   readonly summary: string;
   /**
@@ -516,6 +530,8 @@ function readActionTrace(document: unknown): ActionTrace | undefined {
   const recordedFor = recordedForRaw === undefined ? undefined : readProvenance(recordedForRaw);
   if (recordedForRaw !== undefined && recordedFor === undefined) return undefined;
 
+  const recordedBy = readRecordedModel(raw['recordedBy'], MAX_TRACE_DESCRIPTOR_CHARS);
+
   const summary = readBoundedText(raw['summary'], MAX_TRACE_SUMMARY_CHARS);
   if (summary === undefined) return undefined;
 
@@ -554,6 +570,7 @@ function readActionTrace(document: unknown): ActionTrace | undefined {
       ...(executorVersion === undefined ? {} : { version: executorVersion }),
     },
     ...(recordedFor === undefined ? {} : { recordedFor }),
+    ...(recordedBy === undefined ? {} : { recordedBy }),
     summary,
     ...(startPath === undefined ? {} : { startPath }),
     ...(endPath === undefined ? {} : { endPath }),
@@ -572,6 +589,17 @@ function readAnchors(document: unknown): TraceTargetDescriptor[] | undefined {
   return each(document, readDescriptor);
 }
 
+/** The `modifiers` of a recorded tap-family action: a non-empty list of distinct key modifiers, or undefined when malformed. */
+function readModifiers(document: unknown): readonly KeyModifier[] | undefined {
+  if (!Array.isArray(document) || document.length === 0 || document.length > KEY_MODIFIERS.length) return undefined;
+  const modifiers: KeyModifier[] = [];
+  for (const value of document) {
+    if (!isKeyModifier(value) || modifiers.includes(value)) return undefined;
+    modifiers.push(value);
+  }
+  return modifiers;
+}
+
 function readRecordedAction(document: unknown): RecordedAction | undefined {
   if (typeof document !== 'object' || document === null || Array.isArray(document)) {
     return undefined;
@@ -583,7 +611,10 @@ function readRecordedAction(document: unknown): RecordedAction | undefined {
   const name = raw['name'];
   if (isNodeActionName(name)) {
     const target = readDescriptor(raw['target']);
-    return target === undefined ? undefined : { name, summary, target };
+    if (target === undefined) return undefined;
+    if (raw['modifiers'] === undefined) return { name, summary, target };
+    const modifiers = isTapActionName(name) ? readModifiers(raw['modifiers']) : undefined;
+    return modifiers === undefined ? undefined : { name, summary, target, modifiers };
   }
   switch (name) {
     case 'type': {
@@ -946,13 +977,6 @@ function readProvenance(document: unknown): TraceProvenance | undefined {
     ...(callIndex === undefined ? {} : { callIndex }),
     ...(agent === undefined ? {} : { agent }),
   };
-}
-
-function readBoundedText(value: unknown, maxChars: number): string | undefined {
-  if (typeof value !== 'string' || value.trim() === '' || value.length > maxChars) {
-    return undefined;
-  }
-  return value;
 }
 
 /** One to `MAX_TRACE_UPLOAD_PATHS` verbatim paths, each a replay input like a typed value. */

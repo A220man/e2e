@@ -54,8 +54,8 @@ import {
   type ModelTally,
 } from './format.ts';
 import { ExploreView } from './list-explore.ts';
-import { isShownEvent, type FileGroup, type RunningTest, type TestLine } from './list-model.ts';
-import { stepLine } from './list-steps.ts';
+import { isShownEvent, type ConfiguredModel, type FileGroup, type ReplayNotice, type RunningTest, type TestLine } from './list-model.ts';
+import { replayLine, replayNotices, stepLine } from './list-steps.ts';
 import { LiveWindow } from './live-window.ts';
 import { repeatGroups, repeatLine, repeatSummary, type RepeatRun } from './repeats.ts';
 import { RunningTree } from './running-tree.ts';
@@ -115,6 +115,9 @@ interface ResultDetails {
   readonly screenPath: string | undefined;
   /** What the app logged during the told attempt, as `2 errors, 1 warning`; undefined for nothing. */
   readonly appLog: string | undefined;
+  /** Why the told attempt skipped itself, when it failed anyway. */
+  readonly skipReason: string | undefined;
+  readonly replays: readonly ReplayNotice[];
 }
 
 /** `2 errors, 1 warning`: the app log lines that say something went wrong. */
@@ -129,7 +132,7 @@ function appLogTally(appLog: readonly AppLogRecord[]): string | undefined {
 }
 
 /** Details of an ordinary result: summed over its attempts, the error from the last. */
-function attemptDetails(attempts: readonly AttemptRecord[]): ResultDetails {
+function attemptDetails(attempts: readonly AttemptRecord[], configured: ConfiguredModel | undefined): ResultDetails {
   const steps = attempts.map((attempt) => attempt.steps);
   // A retry the run interrupted tells nothing; the failure before it is the verdict.
   const told = attempts.findLast((attempt) => attempt.status !== 'interrupted') ?? attempts.at(-1);
@@ -142,6 +145,8 @@ function attemptDetails(attempts: readonly AttemptRecord[]): ResultDetails {
     videos: videoPaths(attempts),
     ...failureOf(told),
     appLog: appLogTally(told?.appLog ?? []),
+    skipReason: told?.status === 'skipped' ? undefined : told?.skip?.reason,
+    replays: replayNotices(steps, configured),
   };
 }
 
@@ -174,7 +179,7 @@ function videoPaths(attempts: readonly { readonly artifacts: readonly ArtifactRe
  * that attempt never ran (skipped, or absent after a launch failure) inherits
  * the attempt's error, since that is what stopped it.
  */
-function serialMemberDetails(group: SerialGroupRecord, testId: string): ResultDetails {
+function serialMemberDetails(group: SerialGroupRecord, testId: string, configured: ConfiguredModel | undefined): ResultDetails {
   const runs = group.attempts.map((attempt) => ({
     attempt,
     member: attempt.members.find((member) => member.testId === testId),
@@ -193,6 +198,8 @@ function serialMemberDetails(group: SerialGroupRecord, testId: string): ResultDe
     videos: videoPaths(group.attempts),
     ...failureOf(own === undefined ? undefined : { failure: own.failure, artifacts: last?.attempt.artifacts ?? [] }),
     appLog: appLogTally(own?.appLog ?? []),
+    skipReason: neverRan ? undefined : own.skip?.reason,
+    replays: replayNotices(steps, configured),
   };
 }
 
@@ -209,6 +216,8 @@ interface Failure {
   readonly failure: FailureEvidence | undefined;
   readonly screenPath: string | undefined;
   readonly appLog: string | undefined;
+  /** Why a failed test skipped itself: the skip did not outrank the failure. */
+  readonly skipReason?: string | undefined;
 }
 
 const DEFAULT_OUTPUT: ListReporterOutput = {
@@ -285,12 +294,15 @@ export class ListReporter implements Reporter {
    * there only when no step named one.
    */
   private models: string | undefined;
+  private configuredModel: ConfiguredModel | undefined;
   /**
    * The exploration an `e2e explore` run reports through `explore` events;
    * while present, its view stands in for the one synthetic test's file
    * block, live rows, failure entry, and test counters.
    */
   private explore: ExploreView | undefined;
+  /** The target the exploration's test started on, kept past the test's end for the record. */
+  private exploredTarget: string | undefined;
   /** The stream and source of the output line printed last, while nothing else printed since. */
   private lastOutput: string | undefined;
   /**
@@ -483,6 +495,7 @@ export class ListReporter implements Reporter {
 
   private runStarted(event: RunEventOf<'run-started'>): void {
     const { pc } = this;
+    this.configuredModel = event.model === undefined ? undefined : { label: event.model, agent: event.agents?.[0] ?? 'default' };
     this.projectRoot = event.projectRoot;
     this.artifactsRoot = event.artifactsRoot;
     this.targets = event.targets;
@@ -674,12 +687,13 @@ export class ListReporter implements Reporter {
    * rather than failing the run.
    */
   private detailsOf(result: RunEventResult): ResultDetails {
-    if (result.serialGroupId === undefined) return attemptDetails(result.attempts);
+    const configured = this.configuredModel?.agent === result.agent ? this.configuredModel : undefined;
+    if (result.serialGroupId === undefined) return attemptDetails(result.attempts, configured);
     const pending = this.pendingSerial.get(result.serialGroupId);
-    if (pending === undefined) return attemptDetails([]);
+    if (pending === undefined) return attemptDetails([], configured);
     pending.remaining -= 1;
     if (pending.remaining <= 0) this.pendingSerial.delete(result.serialGroupId);
-    return serialMemberDetails(pending.group, result.test.id);
+    return serialMemberDetails(pending.group, result.test.id, configured);
   }
 
   private testFinished(result: RunEventResult): void {
@@ -694,7 +708,7 @@ export class ListReporter implements Reporter {
     // Read before `detailsOf` releases the result's serial group.
     const skippedAfter = failureBeforeSkip(result, (id) => this.pendingSerial.get(id)?.group);
     const id = resultId(result.test.id, result.target.name, result.agent, result.repeat);
-    const { durationMs, usage, models, cache, error, videos, failure, screenPath, appLog } = this.detailsOf(result);
+    const { durationMs, usage, models, cache, error, videos, failure, screenPath, appLog, skipReason, replays } = this.detailsOf(result);
     addUsage(this.runUsage, usage);
     addModelTally(this.runModels, models);
     addCacheTally(this.runCache, cache);
@@ -717,6 +731,7 @@ export class ListReporter implements Reporter {
       firstErrorLine: error === undefined ? undefined : bounded(error.message).split('\n')[0],
       skipReason: result.skip === undefined ? undefined : bounded(result.skip.reason),
       steps,
+      replays,
     };
     group.lines.push(line);
     this.runs.push({
@@ -726,7 +741,7 @@ export class ListReporter implements Reporter {
       run: { repeat: result.repeat, status: result.status, code: error?.code ?? result.attempts.findLast((attempt) => attempt.status !== 'passed')?.error?.code },
     });
     if (statusBucket(result.status) === 'failed') {
-      this.failures.push({ id, group, title, status: result.status, error, videos, failure, screenPath, appLog });
+      this.failures.push({ id, group, title, status: result.status, error, videos, failure, screenPath, appLog, skipReason });
     }
     if (skippedAfter !== undefined) {
       this.skippedFailures.push({ id, group, title, status: result.status, error: skippedAfter.error, videos, ...failureOf(skippedAfter), appLog: undefined });
@@ -799,12 +814,14 @@ export class ListReporter implements Reporter {
       counts.interrupted > 0 ||
       counts.flaky > 0 ||
       this.groups.size === 1 ||
+      group.lines.some((line) => line.replays.length > 0) ||
       (this.live && group.lines.some((line) => line.steps.length > 0));
     if (!verbose) return;
     const ordered = group.lines.toSorted((a, b) => a.declarationIndex - b.declarationIndex);
     for (const line of ordered) {
       for (const rendered of this.testLine(line)) this.print(rendered);
       for (const step of line.steps) this.print(`${STEP_INDENT}${stepLine(pc, step)}`);
+      for (const replay of line.replays) this.print(`${STEP_INDENT}${replayLine(pc, replay)}`);
     }
   }
 
@@ -915,9 +932,14 @@ export class ListReporter implements Reporter {
     return this.tree.render(running, this.summaryRows(false), Date.now(), room, this.inFlight);
   }
 
-  /** The badge of the explored target: an exploration runs on exactly one. */
+  /**
+   * The badge of the explored target: an exploration runs on exactly one,
+   * the one its test started on. `targets` lists every configured target,
+   * so the first of those is only right when `--target` named it.
+   */
   private exploreBadge(): string {
-    return this.badge(this.targets[0] ?? '');
+    this.exploredTarget ??= [...this.pairs.values()].find((test) => test.executing)?.group.target;
+    return this.badge(this.exploredTarget ?? this.targets[0] ?? '');
   }
 
   /**
@@ -968,7 +990,7 @@ export class ListReporter implements Reporter {
     this.print('');
     this.print(this.errorBanner(`${heading} ${failures.length}`));
     this.print('');
-    failures.forEach(({ id, group, title, status, error, videos, failure, screenPath, appLog }, index) => {
+    failures.forEach(({ id, group, title, status, error, videos, failure, screenPath, appLog, skipReason }, index) => {
       this.print(
         `${pc.bold(pc.bgRed(status === 'skipped' ? ' SKIP ' : ' FAIL '))} ${this.badge(group.target)} ${bounded(group.file)}${this.separator}${title}`,
       );
@@ -980,6 +1002,7 @@ export class ListReporter implements Reporter {
         for (const line of rest) this.print(pc.red(line));
         this.printFailureLocation(error.stack);
       }
+      if (skipReason !== undefined) this.print(pc.yellow(` ${pc.dim(F_POINTER)} ${pc.dim('skipped')} ${bounded(skipReason)}`));
       this.printEvidence(failure, screenPath, pages[id], appLog);
       this.printVideos(videos);
       const marker = `[${index + 1}/${failures.length}]`;

@@ -11,6 +11,7 @@ import { validateTitle } from '../internal/ids.ts';
 import { realmSlot } from '../internal/realm-slot.ts';
 import { parseSkipCall, skipRunningTest } from '../internal/skip.ts';
 import { unknownKeyMessage } from '../internal/options.ts';
+import type { SourceLocation } from '../internal/source.ts';
 import type {
   DescribeOptions,
   FixtureFn,
@@ -23,12 +24,6 @@ import type {
   TestHookFn,
   TestOptions,
 } from '../types.ts';
-
-export interface SourceLocation {
-  readonly file: string;
-  readonly line: number;
-  readonly column: number;
-}
 
 export interface GroupNode {
   readonly title: string;

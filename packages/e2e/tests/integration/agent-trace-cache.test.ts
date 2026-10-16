@@ -553,6 +553,87 @@ describe('trace cache: modes', () => {
   }, 180_000);
 });
 
+const FAILS_FIRST_ATTEMPT_SUITE = `import { existsSync, rmSync } from 'node:fs';
+import { test, expect } from 'e2e';
+
+const failOnce = new URL('../fail-once', import.meta.url);
+
+test('cached step increments twice', async ({ app, agent, screen }) => {
+  await app.open();
+  await agent.act('increment the counter twice');
+  if (existsSync(failOnce)) {
+    rmSync(failOnce);
+    throw new Error('the first attempt fails before anything verified the step');
+  }
+  await expect(screen.getByRole('status')).toHaveText('2');
+});
+`;
+
+describe('trace cache: --strict-cache never writes the cache', () => {
+  let app: FixtureApp;
+
+  beforeAll(async () => {
+    app = await startFixtureApp();
+  }, 60_000);
+
+  afterAll(async () => {
+    await app?.close();
+  });
+
+  const options = (record: ExecutorRecord, strictCache: boolean) => ({
+    appUrl: app.url,
+    config: {
+      tests: 'tests/**/*.e2e.ts',
+      agents: { default: { executor: twoTapExecutor(record) } },
+      cache: 'read-write' as const,
+      retries: 1,
+    },
+    runOptions: { strictCache },
+  });
+
+  it('replays on a retry and leaves the entry exactly as recorded when the first attempt fails', async () => {
+    const project = createProject({ 'tests/act.e2e.ts': FAILS_FIRST_ATTEMPT_SUITE });
+    try {
+      const recording = await runExisting(project, options({ calls: 0, prefixes: [] }, false));
+      expect(recording.exitCode).toBe(0);
+      const recorded = entryFileState(project);
+      const entry = path.basename(readOnlyEntry(project).file, '.json');
+
+      writeFileSync(path.join(project.dir, 'fail-once'), '', 'utf8');
+      const strict: ExecutorRecord = { calls: 0, prefixes: [] };
+      const outcome = await runExisting(project, options(strict, true));
+      expect(outcome.exitCode).toBe(0);
+      const attempts = resultByTitle(outcome, 'cached step increments twice').attempts;
+      expect(attempts.map((attempt) => attempt.status)).toEqual(['failed', 'passed']);
+      expect(strict.calls).toBe(0);
+      for (const attempt of attempts) {
+        expect(attempt.steps.find((step) => step.api === 'agent.act')?.cache).toEqual({
+          mode: 'self-finalized',
+          replayedActions: 2,
+          totalActions: 2,
+          entry,
+        });
+      }
+      expect(entryFileState(project)).toEqual(recorded);
+    } finally {
+      project.cleanup();
+    }
+  }, 180_000);
+
+  it('runs a never-recorded step live without recording it', async () => {
+    const project = createProject({ 'tests/act.e2e.ts': SUITE });
+    try {
+      const strict: ExecutorRecord = { calls: 0, prefixes: [] };
+      const outcome = await runExisting(project, options(strict, true));
+      expect(outcome.exitCode).toBe(0);
+      expect(strict.calls).toBe(1);
+      expect(existsSync(cacheDir(project))).toBe(false);
+    } finally {
+      project.cleanup();
+    }
+  }, 180_000);
+});
+
 const PIN_SUITE = `import { test, expect } from 'e2e';
 
 test('picks the red pin', async ({ app, agent, screen }) => {

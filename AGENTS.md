@@ -8,7 +8,7 @@ TypeScript 7.
 There is no separate spec. The code is the contract, pinned in three places:
 
 - The emitted `packages/e2e/dist/index.d.ts` (and `dist/engine/index.d.ts`,
-  `dist/oauth/*.d.ts`)
+  `dist/runner.d.ts`, `dist/oauth/*.d.ts`)
   is the public API. `packages/e2e/tests/types/sdk-types.ts` holds compile-time
   assertions (`@ts-expect-error` lines) for the parts that are easy to loosen
   by accident; it runs under the package `typecheck`, never under vitest.
@@ -44,7 +44,15 @@ suites that consume the built packages the way a user would.
   example, and run command; interactive choices derive from this list. These
   presets never import engine implementations.
   - `src/run/` runner core (scheduler, units, workers, retries, sessions;
-    `standalone.ts` opens one attempt with no test body for hosts),
+    `standalone.ts` is the worker a host or MCP's one-shot attempt keeps
+    alive, `standalone-attempt.ts` one attempt on it: reservation, launch,
+    fixtures, deadline, close, `host-trace.ts` its `trace.md`, and
+    `select-target.ts` the target a session names, shared with MCP;
+    `open-session.ts` exposes `openHost` on `e2e/runner` for another test
+    runner: worker-lifetime provisioning, app processes, and engine init,
+    then `host.openSession({ name })` for each test's fixtures, deadline,
+    steps, artifacts, and trace at close. Only one hosted attempt may be
+    opening, live, or closing per process; close it before opening another),
     `src/collect/` registration+selection, `src/locator/` locator AST/engine,
     `src/agent/` the agent (the `act` executor socket plus the judgment
     methods), `src/mcp/` the `e2e mcp` server (a live session that rides
@@ -81,10 +89,33 @@ suites that consume the built packages the way a user would.
   engine's provider seam (`BrowserProvider` for web, `DeviceProvider` for
   mobile) and imports the engine's types only; the engines never know it
   exists.
+  Its docs page under `docs/integrations/` ships with the vendor's logo as
+  the sidebar icon and on its overview card (`authoring-docs`, "Page
+  icons"); `scripts/check-docs-logos.ts` fails `pnpm docs:check` without
+  them.
+- `packages/lightpanda` - the published `@e2e-dev/lightpanda` package: a
+  `BrowserProvider` that starts a local `lightpanda serve` per worker slot
+  and stops it with the run; no vendor SDK, the binary is the dependency.
 - `packages/eas` - the published `@e2e-dev/eas` package: EAS Simulators
   hosted iOS simulators and Android emulators for the mobile engine
   (`DeviceProvider`). Expo publishes no SDK for the sessions API, so it calls
   Expo's GraphQL API with `fetch`, and `@e2e-dev/mobile` is its only peer.
+- `packages/smol` - the published `@e2e-dev/smol` package: Chromium in
+  smol machines microVMs on the runner's own computer for the web engine
+  (`BrowserProvider`), through the `smolmachines` SDK's embedded engine
+  (peer). Each worker slot boots one warm browser machine from the pinned
+  Playwright Ubuntu image; a Node TCP relay exposes DevTools, and SDK agent
+  readiness allows machine startup without waiting for published ports. In
+  `attempt` scope every attempt runs in a copy-on-write branch. With `app`,
+  the app under test runs in the same machine, so a branch also copies its
+  running app and data on the machine. When maintaining this integration,
+  update the provider's SDK dev dependency to a published version and raise
+  its peer minimum only if the provider needs new SDK behavior. Keep the
+  Playwright image and Chromium version in sync with `@e2e-dev/web`. Run
+  `pnpm --filter @e2e-dev/smol test:unit` and `pnpm check`, then verify live
+  machines in both attempt and worker scopes with an app running in the VM.
+- `packages/limrun` — the Limrun hosted mobile device provider. Each worker
+  leases one remote device, installs its app, and releases the device at exit.
 - `packages/decision` — the published `@e2e-dev/decision` package: a
   `StepExecutor` (`decisionExecutor()`) that drives `agent.act` and
   `agent.assert` through an AI SDK *decision* model answering `choice`
@@ -97,6 +128,10 @@ suites that consume the built packages the way a user would.
   keeps it current on reruns, writing the same text to the job summary. It
   reads the token, event, and repository when the run finishes, never at
   config load, and renders the page with `renderMarkdownReport` from `e2e`.
+- `packages/testmu` — the published `@e2e-dev/testmu` package: TestMu AI
+  (formerly LambdaTest) hosted Android emulators, iOS simulators, and real
+  devices for the mobile engine (`DeviceProvider`), through agent-device's
+  `@agent-device/testmu` plugin.
 - `apps/testbed` (`@e2e-dev/testbed`, private) — dogfood project that
   consumes the **built** packages like a real user would: the playground app
   where every runner feature (sessions, routes, downloads, frames, uploads,
@@ -128,8 +163,8 @@ suites that consume the built packages the way a user would.
   diffs against the source minimal, and name no company a scenario was
   distilled from.
 - `examples/` — standalone user-facing projects, one per technology
-  (`with-vite`, `with-next`, `with-expo`, `with-swiftui`, `with-compose`,
-  `with-kotlin-multiplatform`, `with-flutter`), each the same
+  (`with-vite`, `with-next`, `with-astro`, `with-expo`, `with-swiftui`,
+  `with-compose`, `with-kotlin-multiplatform`, `with-flutter`), each the same
   one-screen greeter demo with deterministic and agent tests. They install
   the published packages from npm, sit outside the pnpm workspace, commit no
   lockfile, and run in no CI; oxlint and fallow ignore them. A change runs
@@ -139,12 +174,20 @@ suites that consume the built packages the way a user would.
   native project, as a user would.
 - `docs/` (the Mintlify docs site; pages are the `.mdx` files under `docs/`,
   navigation, theme, and redirects in `docs/docs.json`, extra CSS in
-  `docs/style.css`; `docs/examples/` is typechecked and shown verbatim on
-  docs pages and in `skills/e2e/` (`docs/examples/skill/`), kept in sync by
-  `scripts/check-docs-examples.ts`; a shell
+  `docs/style.css`, the table of contents scroll in
+  `docs/table-of-contents.js`; `docs/examples/` is typechecked and shown
+  verbatim on docs pages and in `skills/e2e/` (`docs/examples/skill/`), kept
+  in sync by `scripts/check-docs-examples.ts`; a shell
   block that runs `npx` or `npm install`/`ci` sits in a `<CodeGroup>` of
   `npm`, `pnpm`, and `bun` blocks, which Mintlify syncs site-wide, enforced
-  by `scripts/check-docs-package-managers.ts`). The `e2e` build copies the
+  by `scripts/check-docs-package-managers.ts`; every navigation page but the
+  home page has a social card in `docs/images/og/`, rendered with
+  `@vercel/og` by `docs/og/generate.tsx` (`pnpm docs:og`, also run by
+  `docs:dev`) and committed with the `og:image` frontmatter it writes, since
+  Mintlify runs no build step of ours; `docs:check` fails on a stale card,
+  and a page without one falls back to the brand card `images/og.png` set
+  in `docs.json`).
+  The `e2e` build copies the
   pages to `packages/e2e/docs/` (gitignored,
   `packages/e2e/scripts/prepare-build.ts`) so the published package ships
   them for agents to read offline.
@@ -154,10 +197,27 @@ suites that consume the built packages the way a user would.
   directories. The `e2e` build copies it to `packages/e2e/skills/`
   (gitignored) so the published package ships it; `src/cli/skill.ts` reads
   that copy first and the repo source as the fallback, and `e2e init` writes
-  it into a project's `.agents/skills/` and `.claude/skills/`.
-- `.dev/skills/` — the skills we use to work on this repo (`babysit`,
-  `ship-pr`, `verify`, `writing-pr`). `npx skills add tester-army/e2e`
-  offers `e2e` alone: its default scan never looks in `.dev/`, and it skips
+  it into a project's `.agents/skills/` and `.claude/skills/`. `SKILL.md`
+  opens with a table that routes each job to one reference, and every
+  reference over 100 lines opens with a `## Contents` list of its sections
+  (`tests/unit/skill.test.ts`).
+- `skills/create-verification-skill/`: a generator skill for consumers;
+  it writes a project-local `verify-<app>` skill and feature map on top of
+  e2e, with the bug bash wired to the map. Installed with `npx skills add
+  tester-army/e2e --skill create-verification-skill`; not shipped in the
+  package and not read by `e2e guide`. `references/example/` is the skill
+  it generated and ran for `apps/testbed`: regenerate it when a playground
+  route, label, or test it names changes.
+- `skills/migrate-to-e2e/`: a consumer skill that ports a Playwright,
+  Cypress, Selenium, Detox, or Maestro suite one slice per session, the old
+  suite running beside the new one, with a `MIGRATION.md` progress file the next
+  session resumes from. It routes to `docs/migrate/<runner>.mdx` for the
+  API mapping, so a mapping change edits the guide, not the skill. Installed
+  with `npx skills add tester-army/e2e --skill migrate-to-e2e`; not shipped
+  in the package and not read by `e2e guide`.
+- `.dev/skills/` — the skills we use to work on this repo (`authoring-docs`,
+  `babysit`, `ship-pr`, `verify`, `writing-pr`). `npx skills add tester-army/e2e`
+  offers only `skills/*`: its default scan never looks in `.dev/`, and it skips
   `.claude/skills/<name>`, the relative symlink to each that agents load
   them through, because it does not follow symlinked directories. Its
   `--full-depth` scan does reach `.dev/skills/`; there the frontmatter's
@@ -166,13 +226,26 @@ suites that consume the built packages the way a user would.
   `core.symlinks=true` (CONTRIBUTING.md). The vendored third-party skills in `.claude/skills/` (`unbox-ai`,
   `unslop`, tracked by `skills-lock.json`) stay where they are: the CLI
   skips them as installed project skills.
+- `plugins/e2e/` — one skills-only package for Codex and Claude Code. The
+  root `.agents/plugins/marketplace.json` and `.claude-plugin/marketplace.json`
+  both point here. Edit skill Markdown in `skills/`, then run
+  `pnpm plugins:sync`; `pnpm plugins:check` checks the generated copies,
+  license, Claude manifest, and both manifests' `version`, which is the
+  runner's (`version-packages` syncs it, so plugin
+  installs update once per release; it does the same for
+  `packages/e2e/server.json`, the MCP Registry entry). The Codex manifest's other fields,
+  assets, README, and per-skill `agents/openai.yaml` are maintained in the
+  plugin. Keep the
+  package self-contained and leave the repository's development MCP
+  configuration outside it. Example skills use `SKILL.example.md` so clients
+  do not discover them as additional skills.
 
 ## Commands
 
 Build first — nearly everything downstream consumes `dist`.
 
 ```bash
-pnpm check          # lint -> check:dead-code -> typecheck -> docs:check-errors -> check:peer-ranges -> check:install-scripts -> docs:check (full gate)
+pnpm check          # lint -> check:dead-code -> typecheck -> docs:check-errors -> check:peer-ranges -> check:install-scripts -> plugins:check -> mcp-server:check -> docs:check (full gate)
 pnpm test           # builds, then vitest unit + integration
 pnpm test:testbed   # builds, then runs the real CLI against the playground app
 pnpm test:web-benchmark   # builds, then runs the real CLI against the benchmark scenarios
@@ -416,9 +489,11 @@ trees, on both platforms, without a device.
   field): strict lists the file store and fails a step whose
   key misses while an entry recorded for the same step sits under another key
   (`cache/rekeyed.ts`). Only entries whose `recordedFor` names the whole step
-  (params digest, occurrence, agent) count; a `read-write` replay completes
-  an older one. Such a change re-records every entry and deletes the old ones
-  in the same pull request. A step that was never recorded still runs live.
+  (params digest, occurrence, agent) count; a lenient `read-write` replay
+  completes an older one. Such a change re-records every entry and deletes the
+  old ones in the same pull request. A step that was never recorded still runs
+  live. A strict run replays on retries too and never writes or deletes an
+  entry, whatever the mode.
   The web benchmark's entries are in. The mobile benchmark's iOS entries are
   recorded on a Mac; nobody has recorded on an Android emulator yet, so the
   Android side spends model calls until an emulator recording is committed.
@@ -452,8 +527,8 @@ trees, on both platforms, without a device.
     `authorizeSecretFill` (`secrets.ts`) requires the secret configured for
     the run, an enabled editable node, and a password field for a password.
     There is no origin check: the value goes to whatever site the page is on
-    (`docs/security.mdx`). The model never sees or picks the value. A test's
-    own `fill(secret)` is trusted code and runs none of these checks.
+    (`docs/reference/security.mdx`). The model never sees or picks the value.
+    A test's own `fill(secret)` is trusted code and runs none of these checks.
   - Every model tool call is parsed into a closed schema and authorized
     immediately before dispatch. Nothing runs on a refusal: an unknown tool
     name or an undeclared field goes back to the model as the call's error
@@ -523,7 +598,10 @@ trees, on both platforms, without a device.
   any prose an agent writes here; other agents install it with
   `npx skills add okwasniewski/dotfiles --skill unslop`.
 - Releases go through changesets: a user-visible change adds a `.changeset/`
-  entry. Peer ranges point one way only (engine -> `e2e`, integration ->
+  entry. On `0.x` the bump is `patch` for a feature or fix; never
+  pick `minor` on your own. A breaking change is a `minor` with the summary
+  opening `**Breaking:**`; a `minor` or `major` for a release the maintainer
+  calls opens `**Release:**` (`scripts/check-changeset-bumps.ts`, `pnpm check`). Peer ranges point one way only (engine -> `e2e`, integration ->
   engine) and read `>=<major.minor.patch> <major+1>`, the floor the oldest
   sibling the package works with. Raise it when a package starts relying on a
   newer sibling's export or contract field;
@@ -574,7 +652,7 @@ trees, on both platforms, without a device.
   needs `node scripts/restore-peer-ranges.ts` after it, or `pnpm check` fails
   on the pin.
 - The runner publishes as the unscoped `e2e` (entry points `e2e`, `e2e/agent`,
-  `e2e/engine`, `e2e/oauth/chatgpt`, `e2e/oauth/copilot`, `e2e/oauth/grok`, `e2e/oauth/opencode-console`; the bin is `e2e` too); engines, reporters, and integrations publish public
+  `e2e/engine`, `e2e/runner`, `e2e/oauth/chatgpt`, `e2e/oauth/copilot`, `e2e/oauth/grok`, `e2e/oauth/opencode-console`; the bin is `e2e` too); engines, reporters, and integrations publish public
   under the `@e2e-dev` scope. The `@e2edev` scope (moved to `@e2e-dev` on
   2026-09-28), `@e2edev/e2e`, `@e2edev/oauth` (folded into `e2e/oauth` on
   2026-09-21), and `@e2e-dev/integrations` (moved to `@e2e-dev/kernel` on

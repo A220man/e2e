@@ -129,6 +129,24 @@ describe.each(schemas)('%s schema', (name) => {
       expect(validate.errors).toEqual(expect.arrayContaining([expect.objectContaining({ keyword: 'required', params: { missingProperty: 'interrupted' } })]));
     });
 
+    it('keeps a skip reason on a skipped or failed attempt, never on a passed one', () => {
+      const report = readJson('fixtures', 'report-v1.valid.json') as {
+        run: { results: { attempts: { status: string; skip?: unknown; error?: unknown }[] }[] };
+      };
+      const attempt = report.run.results[1]!.attempts[0]!;
+      expect(attempt).toMatchObject({ status: 'skipped', skip: { cause: 'explicit' } });
+      const { skip } = attempt;
+      delete attempt.skip;
+      expect(validate(report)).toBe(false);
+      attempt.skip = skip;
+      attempt.status = 'failed';
+      attempt.error = { category: 'test', code: 'ASSERTION_FAILED', message: '1 soft assertion failed', retryable: true, phase: 'body' };
+      expect(validate(report)).toBe(true);
+      delete attempt.error;
+      attempt.status = 'passed';
+      expect(validate(report)).toBe(false);
+    });
+
     it('lets a --last-failed rerun carry results, serial groups, and hook failures, at least one result of them', () => {
       const report = readJson('fixtures', 'report-v1.valid.json') as { run: { carried?: Record<string, unknown> } };
       const carried = report.run.carried!;
@@ -175,6 +193,23 @@ describe.each(schemas)('%s schema', (name) => {
       cache.derived = 'guessed';
       expect(validate(report)).toBe(false);
       delete cache.derived;
+      expect(validate(report)).toBe(true);
+    });
+
+    it('validates recording identities while keeping legacy reports valid', () => {
+      const report = readJson('fixtures', 'report-v1.valid.json') as { run: { results: { attempts: { steps: { cache?: Record<string, unknown> }[] }[] }[] } };
+      const cache = report.run.results[0]!.attempts[0]!.steps[0]!.cache!;
+      for (const field of ['provider', 'model']) {
+        cache['recordedBy'] = { provider: 'test', model: 'A', [field]: 'x'.repeat(300) };
+        expect(validate(report)).toBe(true);
+        cache['recordedBy'] = { provider: 'test', model: 'A', [field]: 'x'.repeat(301) };
+        expect(validate(report)).toBe(false);
+      }
+      for (const recordedBy of [null, { provider: '', model: 'A' }, { provider: 'test', model: '  ' }, { provider: 'test' }, { provider: 'test', model: 1 }, { provider: 'test', model: 'A', calls: 1 }]) {
+        cache['recordedBy'] = recordedBy;
+        expect(validate(report)).toBe(false);
+      }
+      delete cache['recordedBy'];
       expect(validate(report)).toBe(true);
     });
 

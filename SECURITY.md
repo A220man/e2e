@@ -1,7 +1,9 @@
 # Security
 
-The user-facing version of this document, with every rule and limit as the
-code enforces it, is [e2e.tester.army/docs/security](https://e2e.tester.army/docs/security).
+The user-facing version of this document is
+[e2e.tester.army/docs/security](https://e2e.tester.army/docs/security). Every
+rule and limit, as the code enforces it, is in
+[e2e.tester.army/docs/reference/security](https://e2e.tester.army/docs/reference/security).
 
 ## Reporting a vulnerability
 
@@ -112,14 +114,17 @@ stores no request address and, because every event carries
 `$geoip_disable: true`, derives no location from it.
 
 Opt out with `e2e telemetry disable`, `E2E_TELEMETRY_DISABLED=1`, or
-`DO_NOT_TRACK=1`. Telemetry is a CLI concern; the runner itself sends nothing.
+`DO_NOT_TRACK=1`. Besides the CLI, only `run()` from `e2e/runner` sends
+telemetry: one `e2e_run_completed` event per run that returns a report, under
+the same opt-outs.
 Telemetry falls under the disclosure policy above.
 
 There is no crash reporting and no update check. The complete list of
 outbound connections a run can make:
 
-- one telemetry request per CLI invocation to `eu.i.posthog.com`, plus at
-  most one per session that `e2e mcp` serves, unless opted out
+- one telemetry request per CLI invocation or completed `run()` to
+  `eu.i.posthog.com`, plus at most one per session that `e2e mcp` serves,
+  unless opted out
 - one request to `eu.i.posthog.com` per `e2e feedback` someone runs, carrying
   the report written into its flags; `E2E_TELEMETRY_DISABLED` and
   `DO_NOT_TRACK` stop it

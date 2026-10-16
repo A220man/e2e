@@ -9,6 +9,7 @@
  */
 
 import path from 'node:path';
+import { modelLabel } from '../config/agent.ts';
 import { isLoopbackHost } from '../internal/urls.ts';
 import type { AppLogSource } from '../engine/index.ts';
 import type { AppLogRecord, StepCacheInfo, StepCacheRecord, StepEvent, StepTurn } from '../run/steps.ts';
@@ -29,6 +30,8 @@ const MAX_SCREEN_CHARS = 24_000;
 const MAX_SUMMARY_CANDIDATES = 3;
 
 export interface TracePageOptions {
+  /** The page is the whole record of a hosted session: there is no `report.json` to point at. */
+  readonly standalone?: true | undefined;
   /** A link to a source line, when the commit is known. */
   readonly sourceUrl?: ((file: string, line: number) => string) | undefined;
   /** Where the run's artifacts can be fetched; evidence links there. */
@@ -113,11 +116,26 @@ export function toldAttempt(result: ReportResult, final: Outcome): AttemptView {
 /** A step that did not pass. */
 export type FailedStep = ReportStep & { readonly status: Exclude<ReportStep['status'], 'passed'> };
 
-/** The step a failure happened at: the first that did not pass, with its position. */
-export function failedStepOf(steps: readonly ReportStep[]): { index: number; step: FailedStep } | undefined {
-  const index = steps.findIndex((step) => step.status !== 'passed');
-  const step = steps[index];
-  return step === undefined || step.status === 'passed' ? undefined : { index, step: step as FailedStep };
+/**
+ * The step whose error ended the attempt, with its position: the step in the
+ * error's phase whose own error carries its code and line, else the last with
+ * its code, since a caught failure comes earlier, else the step a timeout or
+ * interrupt cut.
+ */
+export function failedStepOf(attempt: { readonly steps: readonly ReportStep[]; readonly error?: ReportError | undefined }): { index: number; step: FailedStep } | undefined {
+  const error = attempt.error;
+  if (error === undefined) return undefined;
+  const phase = error.phase;
+  const candidates = attempt.steps.flatMap((step, index) =>
+    step.status !== 'passed' && (phase === undefined || (step.phase ?? 'body') === phase) ? [{ index, step: step as FailedStep }] : [],
+  );
+  const alike = candidates.filter(({ step }) => step.error?.code === error.code);
+  const line = error.source;
+  if (line !== undefined && alike.length > 0) {
+    // The step's own error, not its source: that is the call site, a line below the `await` of a split call.
+    return alike.findLast(({ step }) => step.error?.source?.file === line.file && step.error.source.line === line.line);
+  }
+  return alike.at(-1) ?? candidates.findLast(({ step }) => step.status === 'cancelled');
 }
 
 /**
@@ -133,7 +151,7 @@ export function attemptsLine(result: ReportResult, final: Outcome): string | und
     .filter((attempt) => attempt.status !== 'passed' && attempt.status !== 'skipped' && attempt.status !== 'interrupted' && (attempt.error !== undefined || attempt.steps.length > 0))
     .map((attempt) => ({
       code: cell(attempt.error?.code ?? attempt.status, 128),
-      step: failedStepOf(attempt.steps)?.index,
+      step: failedStepOf(attempt)?.index,
     }));
   const [first] = failed;
   if (first === undefined || final.attempts.length < 2 || failed.length < 2) return undefined;
@@ -164,7 +182,7 @@ export function attemptsLine(result: ReportResult, final: Outcome): string | und
 export function failureSource(result: ReportResult, told: AttemptView): ReportSource {
   const fromError = told.error?.source;
   if (fromError !== undefined) return fromError;
-  const step = failedStepOf(told.steps)?.step;
+  const step = failedStepOf(told)?.step;
   if (step !== undefined && step.source.file !== 'unknown') return step.source;
   return result.source;
 }
@@ -355,6 +373,7 @@ function cacheLine(cache: StepCacheRecord, cacheDir: string | undefined): string
         : `no replay: ${CACHE_REASON_TEXT[cache.reason ?? 'no-entry']}`;
   const parts = [
     `cache: ${how}`,
+    ...(cache.recordedBy === undefined ? [] : [`recorded with ${code(modelLabel({ provider: cache.recordedBy.provider, id: cache.recordedBy.model }), MAX_DETAIL_CHARS)}`]),
     ...(cache.detail === undefined ? [] : [cell(cache.detail, MAX_DETAIL_CHARS)]),
     ...(cache.write === undefined ? [] : [CACHE_WRITE_TEXT[cache.write]]),
     ...(cache.notRecorded === 'param-collision' ? ['nothing recorded: a unique() value collides with another param'] : []),
@@ -480,12 +499,13 @@ export function renderTracePage(report: Report1Document, result: ReportResult, f
     lines.push(`_${STATUS_WORD[result.status]}: no error was recorded._`);
   }
   if (result.status !== 'passed') lines.push(`Look at: ${sourceText(failureSource(result, told), options.sourceUrl)}  `);
+  if (told.status !== 'skipped' && told.skip !== undefined) lines.push(`Also skipped: ${cell(told.skip.reason)}  `);
   const attempts = attemptsLine(result, final);
   if (attempts !== undefined) lines.push(`${attempts}  `);
   if (result.status === 'flaky') lines.push(`Passed after ${plural(final.failedAttempts, 'failed attempt')}; this page tells the last failure.  `);
   if (lines.at(-1) !== '') lines.push('');
 
-  const at = failedStepOf(told.steps);
+  const at = failedStepOf(told);
   if (told.steps.length > 0) {
     const videos = told.artifacts
       .filter((artifact) => artifact.kind === 'video' && artifact.startedAt !== undefined)
@@ -503,6 +523,9 @@ export function renderTracePage(report: Report1Document, result: ReportResult, f
         lines.push(`   > ${cell(step.explanation, MAX_DETAIL_CHARS)}`);
       }
       for (const line of stepDetailLines(step, told.appLog, options)) lines.push(`   - ${line}`);
+      for (const artifact of told.artifacts) {
+        if (artifact.kind === 'screenshot' && step.artifacts.includes(artifact.id)) lines.push(`   - ${artifactPath(artifact, options)}`);
+      }
       lines.push(...stepScreenLines(step.screen));
     });
     lines.push('');
@@ -571,6 +594,7 @@ export function renderTracePage(report: Report1Document, result: ReportResult, f
     lines.push('');
   }
 
-  lines.push(`<sub>e2e ${cell(run.runner.version, MAX_ID_CHARS)} · run ${code(run.id, MAX_ID_CHARS)} · the whole run is in \`report.json\`</sub>`);
+  const footer = `e2e ${cell(run.runner.version, MAX_ID_CHARS)} · run ${code(run.id, MAX_ID_CHARS)}`;
+  lines.push(`<sub>${options.standalone === true ? footer : `${footer} · the whole run is in \`report.json\``}</sub>`);
   return `${lines.join('\n')}\n`;
 }

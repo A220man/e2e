@@ -12,14 +12,14 @@
  * when replay performed no action.
  */
 
-import { deltaEvidenced, deltaHolds, describeDelta } from '../cache/anchors.ts';
+import { deltaEvidenced, deltaMismatch, describeDelta, type DeltaMismatch } from '../cache/anchors.ts';
 import type { AgentCacheContext, ClaimedKey } from '../cache/context.ts';
 import { decideTraceReplay, opensWithNavigate, type TraceReplayMissReason } from '../cache/decide.ts';
 import { sameRoute } from '../cache/route.ts';
 import { keyContextChanges, type CacheAgentIdentity } from '../cache/identity.ts';
 import { recordedProvenance, TraceRecorder } from '../cache/recorder.ts';
 import { expandTrace, templateParams, templatesCollide, templateTrace, type ParamTemplate } from '../cache/template.ts';
-import { readTraceEntry, targetLabel, type ActionTrace, type DerivedReason, type TraceEntry, type TraceTargetDescriptor } from '../cache/trace.ts';
+import { readTraceEntry, targetLabel, type ActionTrace, type DerivedReason, type RecordedModel, type TraceEntry, type TraceTargetDescriptor } from '../cache/trace.ts';
 import { sleep } from '../internal/time.ts';
 import type { StepCacheInfo } from '../run/steps.ts';
 import type { JsonValue } from '../types.ts';
@@ -107,12 +107,6 @@ type EntryRead =
 type StartPurpose = 'path-only' | 'baseline' | 'replay-start';
 
 /**
- * The reasons a recording that exists no longer replays: the app or the
- * entry changed under it. The others describe the step (a value read off
- * the screen, a flow too long to record), the attempt (a retry), or the
- * absence of a recording, and run live under `cache.strict` too.
- */
-/**
  * What staging a passed step's recording came to: `staged` for attempt-end
  * settlement, `no-change` when the step changed nothing a replay could check,
  * or `skipped` for any other reason it could not be recorded (no semantic
@@ -123,6 +117,12 @@ type StageOutcome = 'staged' | 'no-change' | 'skipped';
 /** Characters of a step's cache detail the report admits. */
 const MAX_CACHE_DETAIL_CHARS = 600;
 
+/**
+ * The reasons a recording that exists no longer replays: the app or the
+ * entry changed under it. The others describe the step (a value read off
+ * the screen, a flow too long to record) or the absence of a recording, and
+ * run live under `cache.strict` too.
+ */
 const STALE_REASONS: ReadonlySet<StepCacheInfo['reason']> = new Set<StepCacheInfo['reason']>([
   'invalid-entry',
   'wrong-context',
@@ -156,9 +156,14 @@ export class StepTraceSession {
   private readonly options: StepCacheOptions;
   private readonly redaction: NodeRedaction;
   private info: StepCacheInfo | undefined;
+  private recordedBy: RecordedModel | undefined;
   private prefix: ReplayedPrefix | undefined;
   private startPath: string | undefined;
   private startedMs = Date.now();
+  /** When the replay handed the step to the executor, if it did. */
+  private handedOffMs: number | undefined;
+  /** When the executor finished; its turn is not app settling time. */
+  private executorCompletedMs: number | undefined;
   /**
    * The screen before any action, captured only when this step may write: the
    * staged trace's end anchors are the delta between this and the passing
@@ -180,8 +185,6 @@ export class StepTraceSession {
   private consumedReplay = false;
   /** True once the store returned an entry for this step, whether or not it replayed. */
   private readEntryHit = false;
-  /** True once `cache.strict` failed the step on its recording, which is then kept for review rather than evicted. */
-  private failedStale = false;
   /** Grammar actions recorded so far when an end-mismatch hand-off happened. */
   private actionsAtEndMismatch: number | undefined;
 
@@ -204,7 +207,7 @@ export class StepTraceSession {
 
   /** How the cache participated, for the step's report detail. */
   get cacheInfo(): StepCacheInfo | undefined {
-    return this.info;
+    return this.info === undefined || this.recordedBy === undefined ? this.info : { ...this.info, recordedBy: this.recordedBy };
   }
 
   /** The mid-step hand-off, when a replay diverged after real progress. */
@@ -239,8 +242,8 @@ export class StepTraceSession {
    */
   async begin(): Promise<StepVerdict | undefined> {
     this.startedMs = Date.now();
-    // A retry records like any step but never replays; the report says so
-    // instead of looking like a step that ran with caching off.
+    // Outside `cache.strict`, a retry records like any step but never replays;
+    // the report says so instead of looking like a step that ran with caching off.
     const read: EntryRead = this.cache.replayEligible
       ? await this.readEntry()
       : { status: 'miss', reason: 'retry' };
@@ -276,7 +279,6 @@ export class StepTraceSession {
     const reason = this.info?.reason;
     const { strict } = this.cache;
     if (strict === false || !STALE_REASONS.has(reason)) return;
-    this.failedStale = true;
     throw new AgentError(
       'REPLAY_STALE',
       `the recording of this step no longer replays (${reason}), and cache.strict hands no step to the agent; ${strict.advice}`,
@@ -295,7 +297,6 @@ export class StepTraceSession {
     if (strict === false || strict.recordings === undefined) return;
     const previous = await strict.recordings.underAnotherKey(this.keyHash, recordedProvenance(this.claim.step, this.options.redact));
     if (previous === undefined) return;
-    this.failedStale = true;
     const changes = keyContextChanges(previous.keyedBy, this.claim.context);
     const why = changes.length === 0 ? "the runner, the engine, the app, or the agent's context changed after it was recorded" : `${changes.join(', ')} changed after it was recorded`;
     throw new AgentError(
@@ -336,17 +337,15 @@ export class StepTraceSession {
    *   that diverged hands off again next run, where a model that answers
    *   re-records it.
    */
-  async conclude(outcome: StepOutcome, verdictSummary: string | undefined): Promise<void> {
+  async conclude(outcome: StepOutcome, verdictSummary: string | undefined, recordedBy?: RecordedModel): Promise<void> {
     const recorder = this.recorder;
     if (recorder === undefined) return;
+    if (this.handedOffMs !== undefined) this.executorCompletedMs = Date.now();
     switch (outcome) {
       case 'no-verdict':
         return;
       case 'failed':
-        // A stale recording `cache.strict` failed on stays for the next strict
-        // run to fail on too, until a lenient run re-records it; evicting it
-        // would turn it into a `no-entry` that runs live.
-        if (this.consumedReplay && !this.failedStale) await this.evict();
+        if (this.consumedReplay) await this.evict();
         return;
       case 'passed':
         if (this.repairedAfterEndMismatch(recorder)) await this.evict();
@@ -358,7 +357,7 @@ export class StepTraceSession {
             recordedFor: recordedProvenance(this.claim.step, this.options.redact),
           });
         } else {
-          const staged = await this.stage(recorder, verdictSummary);
+          const staged = await this.stage(recorder, verdictSummary, recordedBy);
           if (staged !== 'staged' && this.readEntryHit) await this.evict();
           else if (staged === 'no-change') this.cache.staged.push({ kind: 'decided', outcome: 'no-change', keyHash: this.keyHash, stepIndex: this.options.stepIndex });
         }
@@ -416,6 +415,7 @@ export class StepTraceSession {
   private async replayEntry(entry: TraceEntry): Promise<StepVerdict | undefined> {
     const start = await this.captureStart('replay-start');
     const trace = entry.payload;
+    this.recordedBy = trace.recordedBy;
     if (!this.host.traceEligible) {
       this.info = this.missed('truncated', trace.actions.length);
       return undefined;
@@ -452,13 +452,14 @@ export class StepTraceSession {
       looksBeforeFree: () => !onEndRoute(screens.at(-1)),
     });
     this.consumedReplay = true;
+    const end = outcome.completed && start?.kind === 'semantic' ? await this.endStateMatches(trace, start, screens) : undefined;
     const stopReason: HandOffReason | undefined = outcome.completed
-      ? start?.kind === 'semantic' && (await this.endStateMatches(trace, start, screens))
+      ? end?.matches === true
         ? undefined
         : 'end-mismatch'
       : (outcome.stopReason ?? 'action-failed');
     if (stopReason === undefined) return this.selfFinalize(trace, outcome);
-    const detail = stopDetail(outcome, stopReason, trace);
+    const detail = stopDetail(outcome, stopReason, trace, end?.failure);
     if (outcome.executed === 0) {
       // A prefix that performed nothing is a miss with a name, not a hand-off:
       // the executor starts from the top and owes the notice nothing.
@@ -472,33 +473,44 @@ export class StepTraceSession {
   /**
    * The trace's postcondition against the live screen: the recorded end
    * route when the live location is known, the recorded delta on the
-   * screen (`deltaHolds`), and evidence that the replay produced it rather
+   * screen (`deltaMismatch`), and evidence that the replay produced it rather
    * than finding it there (`deltaEvidenced`). The evidence is measured from
    * the first screen the replay saw on the route it ended on (`screens`, in
    * order): the start for a step that stays on one screen, the page a
    * recorded navigate opened before the switch on it was tapped. An outcome
    * already showing there proves nothing, and neither does a recording with
-   * no delta at all.
+   * no delta at all. A failure says which of these failed, for the report:
+   * an outcome that already showed, or the anchors that did not hold on the
+   * last look the wait took on the recorded end route.
    */
-  private async endStateMatches(trace: ActionTrace, start: SemanticScreen, screens: readonly ObservedScreen[]): Promise<boolean> {
-    if (!this.host.traceEligible) return false;
+  private async endStateMatches(trace: ActionTrace, start: SemanticScreen, screens: readonly ObservedScreen[]): Promise<EndStateCheck> {
+    if (!this.host.traceEligible) return { matches: false };
     const arrived = await this.endScreen(trace);
-    if (arrived === undefined) return false;
+    if (arrived === undefined) return { matches: false };
     // Both captures may predate a secret the replay resolved; read with the
     // ledger as it is now, an unchanged node is no change.
     const baseline = baselineScreen(screens, arrived.path);
     const baselineNodes = baseline === undefined ? undefined : redactNodesAgain(baseline.nodes, this.redaction);
-    if (!deltaEvidenced(trace, baselineNodes, inputTargets(trace))) return false;
+    if (!deltaEvidenced(trace, baselineNodes, inputTargets(trace))) {
+      // A recording with no delta fails the evidence too, but nothing of it
+      // showed before the replay acted: that is the generic detail.
+      const recorded = (trace.endAnchors?.length ?? 0) > 0 || (trace.goneAnchors?.length ?? 0) > 0;
+      return recorded ? { matches: false, failure: 'already-showing' } : { matches: false };
+    }
     const beforeNodes = baselineNodes ?? redactNodesAgain(start.nodes, this.redaction);
     // Every look the wait takes must still be on the recorded end route: a
     // screen that moved on after the route first matched is another screen.
-    const holds = (screen: SemanticScreen) =>
-      (trace.endPath === undefined || screen.path === undefined || sameRoute(screen.path, trace.endPath)) &&
-      deltaHolds(trace, screen.nodes, beforeNodes);
-    return (await verifyEndState(this.host, holds, {
+    let mismatch: DeltaMismatch | undefined;
+    const holds = (screen: SemanticScreen) => {
+      if (trace.endPath !== undefined && screen.path !== undefined && !sameRoute(screen.path, trace.endPath)) return false;
+      mismatch = deltaMismatch(trace, screen.nodes, beforeNodes);
+      return mismatch === undefined;
+    };
+    const matches = (await verifyEndState(this.host, holds, {
       initial: arrived,
       ...(trace.endWaitMs === undefined ? {} : { waitMs: trace.endWaitMs }),
     })) && this.host.traceEligible;
+    return matches ? { matches } : { matches, ...(mismatch === undefined ? {} : { failure: mismatch }) };
   }
 
   /**
@@ -540,6 +552,7 @@ export class StepTraceSession {
   }
 
   private handOff(outcome: ReplayOutcome, stopReason: HandOffReason, detail: string | undefined): void {
+    this.handedOffMs = Date.now();
     if (stopReason === 'end-mismatch') this.actionsAtEndMismatch = this.recorder?.recordedCount ?? 0;
     this.prefix = {
       replayedActions: outcome.summaries,
@@ -556,6 +569,13 @@ export class StepTraceSession {
       entry: this.keyHash,
       ...(detail === undefined ? {} : { detail: this.reportable(detail) }),
     };
+  }
+
+  /** Returns the app-settling baseline: the executor's verdict or, if it acted, its last action. */
+  private endWaitBaselineMs(recorder: TraceRecorder): number {
+    const lastActionAtMs = recorder.lastActionAtMs ?? this.startedMs;
+    if (this.handedOffMs === undefined || (recorder.lastActionAtMs ?? 0) > this.handedOffMs) return lastActionAtMs;
+    return this.executorCompletedMs ?? this.handedOffMs;
   }
 
   /**
@@ -577,7 +597,7 @@ export class StepTraceSession {
    * does a step that changed nothing a replay could check, no node and no
    * route: a trace without its check would replay on mechanics alone.
    */
-  private async stage(recorder: TraceRecorder, verdictSummary: string | undefined): Promise<StageOutcome> {
+  private async stage(recorder: TraceRecorder, verdictSummary: string | undefined, recordedBy: RecordedModel | undefined): Promise<StageOutcome> {
     if (!this.host.traceEligible || this.startNodes === undefined || recorder.recordedCount === 0) return 'skipped';
     const observation = await probeScreen(this.host, 'held-still');
     if (!this.host.traceEligible || observation?.kind !== 'semantic') return 'skipped';
@@ -591,6 +611,7 @@ export class StepTraceSession {
     const trace = recorder.finalize({
       executor: this.options.executor,
       recordedFor: this.claim.step,
+      ...(recordedBy === undefined ? {} : { recordedBy }),
       summary: verdictSummary ?? 'step passed',
       ...(this.startPath === undefined ? {} : { startPath: this.startPath }),
       ...(endPath === undefined ? {} : { endPath }),
@@ -600,8 +621,10 @@ export class StepTraceSession {
       // plus room for a slower day: the budget a replay waits for the anchors
       // to return. Measured from the last action, not the step's start: the
       // model's thinking time before that action is no reason for a replay,
-      // which does not think, to wait.
-      endWaitMs: Date.now() - (recorder.lastActionAtMs ?? this.startedMs) + END_WAIT_MARGIN_MS,
+      // which does not think, to wait. After a hand-off, the executor's last
+      // action is the baseline when it acted; otherwise its completion is the
+      // baseline. The replay and executor turn are not app settling time.
+      endWaitMs: Date.now() - this.endWaitBaselineMs(recorder) + END_WAIT_MARGIN_MS,
       keyedBy: this.claim.context,
     });
     if (trace === undefined) return 'skipped';
@@ -658,15 +681,30 @@ export class StepTraceSession {
 }
 
 /**
+ * The end check's verdict and, when it is known, why it failed: the recorded
+ * outcome already showed before the replay acted (`deltaEvidenced`), or the
+ * anchors that did not hold (`deltaMismatch`).
+ */
+interface EndStateCheck {
+  readonly matches: boolean;
+  readonly failure?: 'already-showing' | DeltaMismatch;
+}
+
+/**
  * Where and why a replay handed the step back, for the report: the
  * recorded action it stopped at and what was wrong there, or for an end
- * state that never showed, what the recording expected to see.
+ * state that did not hold, why (`failure`): the outcome already showed
+ * before the replay acted, or the anchors that failed on the last look.
+ * With neither known, the screen was never read on the recorded route, and
+ * the detail says what the recording expected to see there.
  */
-function stopDetail(outcome: ReplayOutcome, reason: HandOffReason, trace: ActionTrace): string | undefined {
+function stopDetail(outcome: ReplayOutcome, reason: HandOffReason, trace: ActionTrace, failure?: EndStateCheck['failure']): string | undefined {
   if (reason === 'end-mismatch') {
-    const expected = (trace.endAnchors ?? []).slice(0, 2).map(describeAnchor);
     const where = trace.endPath === undefined ? '' : ` on ${trace.endPath}`;
-    return `every recorded action ran, but the recorded end state did not show${where}${expected.length === 0 ? '' : `: expected ${expected.join(', ')}`}`;
+    if (failure === 'already-showing') return `every recorded action ran, but the recorded outcome already showed${where} before the replay acted there, so nothing proves the replay produced it`;
+    const expected = (trace.endAnchors ?? []).slice(0, 2).map(describeAnchor);
+    const what = failure !== undefined ? mismatchParts(failure) : expected.length > 0 ? `expected ${expected.join(', ')}` : '';
+    return `every recorded action ran, but the recorded end state did not show${where}${what === '' ? '' : `: ${what}`}`;
   }
   const at = outcome.stoppedAt;
   if (at === undefined) return undefined;
@@ -681,6 +719,26 @@ function stopDetail(outcome: ReplayOutcome, reason: HandOffReason, trace: Action
 function describeAnchor(anchor: TraceTargetDescriptor): string {
   const { name, text } = anchor;
   return text !== undefined && name !== undefined && text !== name ? `${targetLabel(anchor)} text=${JSON.stringify(bound(text, 40))}` : targetLabel(anchor);
+}
+
+/**
+ * The anchors a mismatch names, two of each kind at most: those the replay
+ * did not bring up, those it did not clear, and alerts it raised that the
+ * recording never saw. Kinds are joined with commas, never semicolons: the
+ * report line already separates its own parts with those (`cacheLine`).
+ */
+function mismatchParts(mismatch: DeltaMismatch): string {
+  const part = (label: string, anchors: readonly TraceTargetDescriptor[]) => {
+    if (anchors.length === 0) return [];
+    const named = anchors.slice(0, 2).map(describeAnchor).join(' and ');
+    const more = anchors.length > 2 ? ` (+${String(anchors.length - 2)} more)` : '';
+    return [`${label} ${named}${more}`];
+  };
+  return [
+    ...part('missing', mismatch.missing),
+    ...part('still showing', mismatch.present),
+    ...part('unrecorded', mismatch.unrecordedAlerts),
+  ].join(', ');
 }
 
 /** The controls a trace's input actions set a value or a state on: their changed anchors echo the input. */

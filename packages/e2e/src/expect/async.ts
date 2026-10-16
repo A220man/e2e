@@ -19,7 +19,8 @@ import { SampleHistory } from './samples.ts';
 import { attributeOf, denySecureRead, isNodeVisible } from '../locator/engine.ts';
 import { describeExpression } from '../locator/expression.ts';
 import type { LocatorInternals } from '../locator/screen.ts';
-import type { AsyncExpectation, TextMatch, TextMatcherOptions } from '../types.ts';
+import type { AsyncExpectation, ScreenshotOptions, TextMatch, TextMatcherOptions } from '../types.ts';
+import { expectScreenshot } from './screenshot.ts';
 
 interface Sample {
   readonly count: number;
@@ -438,6 +439,10 @@ class AsyncExpectationImpl implements AsyncExpectation {
 
   toHaveAccessibleName(expected: TextMatch, options?: TextMatcherOptions): Promise<void> {
     return this.textMatcher('toHaveAccessibleName', expected, options);
+  }
+
+  toHaveScreenshot(nameOrOptions?: string | ScreenshotOptions, options?: ScreenshotOptions): Promise<void> {
+    return expectScreenshot(this.internals.context, this.internals.expression, this.negated, nameOrOptions, options);
   }
 
   toHaveCount(expected: number, options?: { timeout?: number }): Promise<void> {

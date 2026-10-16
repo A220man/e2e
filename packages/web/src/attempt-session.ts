@@ -6,6 +6,7 @@ import { connectionAbort, withConnectionBudget, withOperationDeadline, type Conn
 import { RefRegistry } from './refs.ts';
 import type { LeaseRecording } from './provider.ts';
 import { ProviderVideo } from './provider-video.ts';
+import type { WebMedia } from './media.ts';
 import { invalidState, translatePwError } from './support.ts';
 import type { WebScreencastOptions } from './surface.ts';
 import { VideoRecorder, type AttemptVideo } from './video.ts';
@@ -18,6 +19,8 @@ interface SessionOptions {
   readonly viewport: ViewportSize | null;
   /** How the engine's own screencast records, when the provider does not record. */
   readonly screencast: WebScreencastOptions;
+  /** The media features every page the attempt opens emulates, until `emulateMedia` changes them. */
+  readonly media: WebMedia;
   readonly contextOptions: BrowserContextOptions;
   readonly acquire: (signal: AbortSignal) => Promise<Browser>;
   readonly configure: (context: BrowserContext) => Promise<void>;
@@ -53,8 +56,12 @@ export class AttemptSession {
   /** Until the attempt's first page opens: a persistent browser's own first tab can serve as that page. */
   private firstPage = true;
   private requestedViewport: { readonly width: number; readonly height: number } | undefined;
+  private media: WebMedia;
+  /** The emulation each page got as it appeared, so the attempt's own page is ready before it shows. */
+  private readonly emulated = new WeakMap<Page, Promise<void>>();
 
   constructor(private readonly options: SessionOptions) {
+    this.media = options.media;
     this.video = options.record === undefined
       ? new VideoRecorder(options.artifactsDir, options.screencast)
       : new ProviderVideo(options.record, options.artifactsDir);
@@ -170,9 +177,13 @@ export class AttemptSession {
       try {
         if (budget.signal.aborted) throw connectionAbort(budget.signal, 'connection');
         await this.options.configure(candidate.context);
+        this.watchPages(candidate.context);
         if (recover && candidate.page !== null) {
           const size = previous?.page?.viewportSize() ?? this.requestedViewport ?? this.options.viewport;
           if (size !== null) await candidate.page.setViewportSize(size);
+          // Emulation belongs to the CDP session that set it, so the new transport sets it again, on the app's own tabs too.
+          await this.applyMedia(candidate.page);
+          await this.emulateOnOthers(candidate.context, candidate.page, (page) => this.applyMedia(page));
           await this.video.pageOpened(candidate.page);
         }
         if (budget.signal.aborted) throw connectionAbort(budget.signal, 'connection');
@@ -206,6 +217,7 @@ export class AttemptSession {
       let identity = binding.identity;
       const size = this.requestedViewport ?? (identity === undefined ? null : this.options.viewport);
       if (size !== null) await page.setViewportSize(size);
+      await (this.emulated.get(page) ?? this.applyMedia(page));
       if (identity !== undefined) identity = { ...identity, target: await targetIdentity(page) };
       this.check(token);
       await this.video.pageOpened(page);
@@ -248,6 +260,55 @@ export class AttemptSession {
     const page = this.current().page;
     if (page !== null && !page.isClosed()) await page.setViewportSize({ width, height });
     this.requestedViewport = { width, height };
+  }
+
+  /**
+   * Emulates media features on every open tab and every tab opened after
+   * them, the app's own included; a feature `media` leaves out keeps its value.
+   */
+  async emulateMedia(media: WebMedia): Promise<void> {
+    // Merged before the await, so a second call made meanwhile builds on this one instead of the old value.
+    this.media = { ...this.media, ...media };
+    const { context, page } = this.current();
+    if (page !== null && !page.isClosed()) await page.emulateMedia(this.media);
+    await this.emulateOnOthers(context, page, (other) => other.emulateMedia(this.media));
+  }
+
+  /**
+   * Runs `emulate` on every open tab but the attempt's own. A tab the app
+   * closes meanwhile fails its own call only; an error on a tab still open
+   * propagates.
+   */
+  private async emulateOnOthers(context: BrowserContext, own: Page | null, emulate: (page: Page) => Promise<void>): Promise<void> {
+    const others = context.pages().filter((page) => page !== own && !page.isClosed());
+    await Promise.all(others.map(async (page) => {
+      try {
+        await emulate(page);
+      } catch (cause) {
+        if (!page.isClosed()) throw cause;
+      }
+    }));
+  }
+
+  /** Sets the attempt's media features on a page before it shows anything; a page with none set keeps the browser's own. */
+  private async applyMedia(page: Page): Promise<void> {
+    if (Object.keys(this.media).length > 0) await page.emulateMedia(this.media);
+  }
+
+  /**
+   * Emulates the attempt's media on each tab as it appears, so a tab the app
+   * opens itself follows a test's change too, on a persistent context as
+   * well, where the engine sets no context options. Playwright emulates per
+   * page, so a test's change reaches it once it exists: its scripts may read
+   * the context's configured values until then. A tab the attempt opens
+   * awaits the same work in `ensurePage`; a tab the app opens is not awaited.
+   */
+  private watchPages(context: BrowserContext): void {
+    context.on('page', (page) => {
+      const applied = this.applyMedia(page);
+      this.emulated.set(page, applied);
+      applied.catch(() => undefined);
+    });
   }
 
   /** Restarts the document while retaining this context's storage. */

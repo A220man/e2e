@@ -172,7 +172,7 @@ export function defineEngine(spec: Engine): EngineHandle {
   }
   const name = spec.name;
   if (typeof spec.version !== 'string' || spec.version.trim() === '') {
-    throw invalid(name, 'version must be a non-empty string; it is provenance and keys the replay cache');
+    throw invalid(name, 'version must be a non-empty string; it is recorded in reports and keys saved sessions');
   }
   if (spec.spiVersion !== ENGINE_SPI_VERSION) {
     throw invalid(
@@ -302,7 +302,7 @@ export function defineEngine(spec: Engine): EngineHandle {
   if (spec.secrets !== undefined) handle['secrets'] = declaredSecrets(name, spec.secrets);
   if (spec.session !== undefined) handle['session'] = hookManifest(name, 'session', spec.session);
 
-  // Assembled key by key above, so the record is an Engine by construction.
+  // oxlint-disable-next-line e2e/no-chained-type-assertions -- assembled key by key above, so the record is an Engine by construction
   return Object.freeze({
     ...handle,
     [engineBrand]: true as const,

@@ -9,9 +9,10 @@
 
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
-import type { Browser, BrowserContext, ElementHandle, FrameLocator, Page, Route } from 'playwright-core';
+import type { Browser, BrowserContext, ElementHandle, FrameLocator, Locator, Page, Route } from 'playwright-core';
 import {
   EngineError,
+  obj,
   raceAbort,
   TestError,
   withinCleanupBudget,
@@ -47,12 +48,13 @@ import { TraceFeed } from './trace-feed.ts';
 import { DialogRouter } from './dialogs.ts';
 import { ensureBrowsersInstalled } from './install.ts';
 import { applyPostSteps, frameSelectors, projectExpression } from './locators.ts';
-import { ROOT_NODE_ID, toSemanticNode } from './observation.ts';
+import { contentBox, frameContentInset, placeRectInFrame, ROOT_NODE_ID, toSemanticNode } from './observation.ts';
 import { captureObservation } from './observation-capture.ts';
 import { maskOptions, secureFieldMasks } from './observe.ts';
 import { connectionAbort, withOperationDeadline, type OperationBound } from './operation-budget.ts';
-import { CLOSED_SHADOW_ROOTS_INIT_SCRIPT } from './closed-shadow.ts';
+import { CLOSED_SHADOW_ROOTS_INIT_SCRIPT, CLOSED_SHADOW_ROOTS_KEY } from './closed-shadow.ts';
 import { ConfiguredInitScripts, type WebInitScript } from './init-scripts.ts';
+import type { WebMedia } from './media.ts';
 import { SECURE_FIELD_SELECTOR, type RawNodeData } from './read-node.ts';
 import { readSelector, takeReadsFunction } from './read-selector.ts';
 import { httpCredentials, installSiteHeaders, lowercaseNames, siteHeadersFor } from './protected-app.ts';
@@ -233,6 +235,21 @@ export interface WebOptions {
    */
   readonly timezoneId?: string;
   /**
+   * The `prefers-color-scheme` every page reports from its first paint, to
+   * its `@media` rules and to `matchMedia`, as Playwright's own
+   * `colorScheme` context option sets it. Defaults to the browser's own.
+   * `browser.emulateMedia` changes it for the rest of one attempt.
+   */
+  readonly colorScheme?: WebMedia['colorScheme'];
+  /**
+   * The `prefers-reduced-motion` every page reports from its first paint, as
+   * Playwright's own `reducedMotion` context option sets it: `'reduce'`
+   * lets an app's own rule turn its animations off, so none races an
+   * assertion. Defaults to the browser's own. `browser.emulateMedia`
+   * changes it for the rest of one attempt.
+   */
+  readonly reducedMotion?: WebMedia['reducedMotion'];
+  /**
    * Scripts every document runs before the page's own, in every tab and
    * frame: JavaScript source, a `{ path }` relative to the project root, or a
    * function, which cannot close over test variables.
@@ -267,6 +284,8 @@ export class PlaywrightSurface {
   private readonly userAgent: string | undefined;
   private readonly locale: string | undefined;
   private readonly timezoneId: string | undefined;
+  /** The configured media features, which every attempt starts from. */
+  private readonly media: WebMedia;
   private readonly configuredInitScripts: ConfiguredInitScripts;
   /** The attempt's init scripts, configured then added, applied to each context the attempt opens. */
   private initScripts: string[] = [];
@@ -299,6 +318,7 @@ export class PlaywrightSurface {
     this.userAgent = options.userAgent;
     this.locale = options.locale;
     this.timezoneId = options.timezoneId;
+    this.media = obj({ colorScheme: options.colorScheme, reducedMotion: options.reducedMotion });
     this.configuredInitScripts = new ConfiguredInitScripts(options.initScripts ?? []);
   }
 
@@ -458,6 +478,7 @@ export class PlaywrightSurface {
       artifactsDir: context.artifactsDir,
       viewport: this.viewport,
       screencast: this.screencast,
+      media: this.media,
       acquire: (signal) => this.acquireBrowser(signal),
       contextOptions: {
         viewport: this.viewport,
@@ -466,6 +487,8 @@ export class PlaywrightSurface {
         ...(this.userAgent === undefined ? {} : { userAgent: this.userAgent }),
         ...(this.locale === undefined ? {} : { locale: this.locale }),
         ...(this.timezoneId === undefined ? {} : { timezoneId: this.timezoneId }),
+        // On the context too, so a tab the app opens itself paints with the configured values before the session reaches it.
+        ...this.media,
         ...(this.headers === undefined ? {} : { serviceWorkers: 'block' as const }),
       },
       configure: async (target) => {
@@ -632,6 +655,11 @@ export class PlaywrightSurface {
     return this.requireSession().setViewport(size);
   }
 
+  /** Emulates media features on the open page, or the one the next navigation opens, for the rest of the attempt. */
+  emulateMedia(media: WebMedia): Promise<void> {
+    return this.requireSession().emulateMedia(media);
+  }
+
   /**
    * The single entry of every operation: rethrows an error latched on an
    * unawaited path, refuses a cancelled operation, races `fn` against the
@@ -732,7 +760,7 @@ export class PlaywrightSurface {
         const token = session.token();
         const refs = session.refs;
         const page = this.requirePage();
-        await this.validateFrames(expression);
+        const frame = await this.frameBox(expression);
         const projected = projectExpression(page, expression, this.testIdAttribute);
         const { displayValue, name, steps } = projected;
         // Every match is read by the `e2e-read` selector engine in the task that finds it, so a
@@ -813,7 +841,7 @@ export class PlaywrightSurface {
           const id = refs.storeLocated(
             pinned === undefined ? { kind: 'locator', locator } : { kind: 'element', element: pinned },
           );
-          return toSemanticNode({ id, revision: '' }, raw);
+          return inFrame(toSemanticNode({ id, revision: '' }, raw), frame);
         });
       },
       staleOr,
@@ -836,7 +864,7 @@ export class PlaywrightSurface {
           this.requireSession().requireObservation();
           return performViewportSwipe(page, action.direction, action.momentum ?? 'none');
         }
-        return dispatchLocatorAction(this.requireSession().refs.lookup(ref), action, currentOperation.timeoutMs, (other) =>
+        return dispatchLocatorAction(this.requireSession().refs.lookup(ref), action, currentOperation, (other) =>
           this.requireSession().refs.lookup(other),
         );
       },
@@ -902,18 +930,26 @@ export class PlaywrightSurface {
     const editable = await Promise.all(
       page.frames().map((frame) =>
         frame
-          .evaluate(() => {
-            const active = document.activeElement;
+          .evaluate((key) => {
+            const recorded: unknown = Reflect.get(globalThis, Symbol.for(key));
+            let active = document.activeElement;
+            while (active !== null) {
+              const root: ShadowRoot | undefined | null = active.shadowRoot ?? (recorded instanceof WeakMap ? recorded.get(active) : undefined);
+              const leaf = root?.activeElement;
+              if (leaf === undefined || leaf === null) break;
+              active = leaf;
+            }
             if (active === null || active === document.body || active === document.documentElement) return false;
             if (active instanceof HTMLInputElement) {
               return !active.disabled && !active.readOnly && !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image', 'range', 'color'].includes(active.type);
             }
             if (active instanceof HTMLTextAreaElement) return !active.disabled && !active.readOnly;
-            if (active instanceof HTMLSelectElement || active instanceof HTMLButtonElement || active instanceof HTMLAnchorElement) {
+            if (active instanceof HTMLSelectElement || active instanceof HTMLButtonElement || active instanceof HTMLAnchorElement ||
+                active instanceof HTMLIFrameElement || active instanceof HTMLFrameElement) {
               return false;
             }
             return true;
-          })
+          }, CLOSED_SHADOW_ROOTS_KEY)
           .catch(() => false),
       ),
     );
@@ -930,10 +966,14 @@ export class PlaywrightSurface {
    * Checks that every frame selector along the expression matches exactly one
    * element, each counted inside the frame before it, the way `project` walks
    * the same chain; a frame-scoped `count` is 0 until that frame's document
-   * has loaded, which is what makes `FRAME_NOT_FOUND` worth retrying.
+   * has loaded, which is what makes `FRAME_NOT_FOUND` worth retrying. Returns
+   * the innermost frame's content box in the top-level viewport, where its
+   * document's viewport starts: undefined for an expression in the main
+   * document, null for a frame with no box.
    */
-  private async validateFrames(expression: LocatorExpression): Promise<void> {
+  private async frameBox(expression: LocatorExpression): Promise<Rect | null | undefined> {
     let scope: Page | FrameLocator = this.requirePage();
+    let element: Locator | undefined;
     for (const selector of frameSelectors(expression)) {
       let count: number;
       try {
@@ -951,7 +991,15 @@ export class PlaywrightSurface {
           retryable: false,
         });
       }
+      element = scope.locator(selector);
       scope = scope.frameLocator(selector);
+    }
+    if (element === undefined) return undefined;
+    try {
+      const border = await element.boundingBox();
+      return border === null ? null : contentBox(border, await element.evaluate(frameContentInset));
+    } catch (cause) {
+      throw translatePwError(cause, 'frame resolution');
     }
   }
 
@@ -1077,4 +1125,18 @@ export class PlaywrightSurface {
       throw cause;
     }
   }
+}
+
+type Rect = NonNullable<SemanticNode['rect']>;
+
+/**
+ * A located node in the top-level viewport's space, as the observation tree
+ * reports it: its box shifted by the frame's and clipped to it, and dropped
+ * when the frame has no box or the node lies outside it.
+ */
+function inFrame(node: SemanticNode, frame: Rect | null | undefined): SemanticNode {
+  if (frame === undefined || node.rect === undefined) return node;
+  const { rect, ...rest } = node;
+  const placed = frame === null ? undefined : placeRectInFrame(rect, frame);
+  return placed === undefined ? rest : { ...rest, rect: placed };
 }

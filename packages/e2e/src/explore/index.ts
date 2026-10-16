@@ -133,9 +133,11 @@ export async function explore(options: ExploreOptions = {}): Promise<ExploreOutc
   // `--session` pulls in runs as the project's own agents, with its cache and
   // retries. The exploration pins no retries and runs with the cache off.
   const explorerAgents = new Map(resolved.agents).set(agentName, withFindingTool(resolvedExplorer, state));
+  // The exploration is bounded by its own `--timeout`, not `maxDuration`.
+  const { maxDuration: _maxDuration, ...runConfig } = raw;
   const outcome = await run({
     cwd: projectRoot,
-    rawConfig: raw,
+    rawConfig: runConfig,
     agent: options.agent,
     env,
     tests: {

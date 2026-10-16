@@ -76,7 +76,11 @@ export interface AttemptRecord {
   artifacts: ArtifactRecord[];
   error?: SerializedError;
   failure?: FailureEvidence;
-  /** Why the body skipped itself (`test.skip(condition, reason)`); set exactly when `status` is `skipped`. */
+  /**
+   * Why the body skipped itself (`test.skip(condition, reason)`). Always set
+   * when `status` is `skipped`; also on a failed attempt whose body skipped
+   * after a soft failure, or whose teardown failed after the skip.
+   */
   skip?: SkipInfo;
   secondaryErrors: SerializedError[];
   /** What the engine said the attempt ran on (`EngineAttemptContext.environment`), redacted. */
@@ -99,6 +103,11 @@ export interface SerialMemberRecord {
   error?: SerializedError;
   /** What the runner saw when this member's failure landed; see `FailureEvidence`. */
   failure?: FailureEvidence;
+  /**
+   * Why the member was skipped: its own `test.skip`, or the runner (a failed
+   * predecessor or hook, an interrupt). Also on a failed member that skipped
+   * itself first; see `AttemptRecord.skip`.
+   */
   skip?: SkipInfo;
   secondaryErrors: SerializedError[];
 }
@@ -202,9 +211,10 @@ export interface FailureBeforeSkip {
 
 /**
  * The failure a test's `test.skip(...)` followed: the last attempt that
- * failed before a skipped retry, or a soft failure the skipping attempt kept.
- * Engine cleanup diagnostics after the skip are not one. A serial member's
- * attempts live on its group, which `groupOf` looks up only for such a member.
+ * failed before a skipped retry, or an error the skipped attempt kept beside
+ * its skip. A soft failure before the skip fails its own attempt. Engine
+ * cleanup diagnostics after the skip are not one. A serial member's attempts
+ * live on its group, which `groupOf` looks up only for such a member.
  */
 export function failureBeforeSkip(
   result: Pick<ResultRecord, 'status' | 'skip' | 'attempts' | 'serialGroupId' | 'test'>,

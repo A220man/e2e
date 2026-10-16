@@ -36,6 +36,7 @@ import { createEngineSession } from '../engine/session.ts';
 import { createExtendedFixtures } from './extended-fixtures.ts';
 import { captureFailureEvidence } from './failure-evidence.ts';
 import { createFixtures, type ArtifactSink } from './fixtures.ts';
+import { WrittenScreenshots } from './screenshots.ts';
 import { publishAttempt } from '../expect/attempt.ts';
 import { PollScope, runInPollScope } from '../expect/poll-scope.ts';
 import { SoftFailures } from '../expect/soft.ts';
@@ -52,7 +53,7 @@ import { isFailedStatus } from './records.ts';
 import { traceScreen } from './step-screens.ts';
 import { runWithRetries } from './retry.ts';
 import { runSerialUnit, type SerialAttemptRun, type SerialAttemptStart, type SerialHost, type SharedSerialSession } from './serial.ts';
-import { interruptedSkip, pairKey, pairResult, unstartedResult } from './units.ts';
+import { interruptedInPhase, interruptedSkip, pairKey, pairResult, unstartedResult } from './units.ts';
 import { adoptSecrecy, carriedSecrecy, processSecrets, registerDerivedSecrets, redactForSession, resolveSecretValue, sessionSecrecy, staticSecretLedger } from './secrecy.ts';
 import { isSecret } from '../secrets.ts';
 import { SessionStaging, SessionStore, targetIdentity, type SessionIdentity } from './sessions.ts';
@@ -194,10 +195,13 @@ export class TargetExecutor implements SerialHost {
   private readonly storedRecordings: StoredRecordings | undefined;
   /** Resolves once the engine's init hook completed for this worker. */
   private engineReady: Promise<void> | undefined;
+  /** The stored screenshots the run wrote, so no comparison passes against one nobody reviewed. */
+  private readonly writtenScreenshots: WrittenScreenshots;
 
   constructor(private readonly options: TargetExecutorOptions) {
     this.target = options.target;
     this.artifactsRoot = options.artifactsRoot;
+    this.writtenScreenshots = new WrittenScreenshots(options.artifactsRoot);
     this.rerunDir = options.rerunDir;
     this.interruptSignal = options.interruptSignal;
     this.debug = options.debug ?? new DebugTrace(false);
@@ -290,7 +294,7 @@ export class TargetExecutor implements SerialHost {
    * Boot work (simulators, device leases) is bounded by the launch timeout
    * but never charged against a step budget.
    */
-  private initEngineOnce(): Promise<void> {
+  initEngineOnce(): Promise<void> {
     const engine = this.target.engine;
     const init = engine?.init?.bind(engine);
     if (init === undefined) return Promise.resolve();
@@ -682,7 +686,7 @@ export class TargetExecutor implements SerialHost {
    * The error is the test's, thrown as it was so `classifyError` keeps its
    * code: `lifecycle` would name every non-engine error an engine failure.
    */
-  private settleAttempt(session: TargetSession, attemptId: string): Promise<void> {
+  settleAttempt(session: TargetSession, attemptId: string): Promise<void> {
     return withScopedBudget(
       this.config.cleanupTimeout,
       this.interruptSignal,
@@ -1024,12 +1028,13 @@ export class TargetExecutor implements SerialHost {
         ...(cache === undefined ? {} : { cache }),
         debug: this.debug,
         models: this.models,
+        test: { file: pair.test.file, titlePath: pair.test.titlePath, writtenScreenshots: this.writtenScreenshots },
       });
       // `expect.poll` and `expect.soft` take no fixture, so the attempt they
       // run on is published here and cleared when `attemptEnd` fires in `finally`.
       const soft = new SoftFailures();
       publishAttempt(
-        { attemptId, testKind: pair.test.kind, assertionTimeout: this.config.assertionTimeout, budget, soft },
+        { attemptId, owner: 'suite', testKind: pair.test.kind, assertionTimeout: this.config.assertionTimeout, budget, soft },
         attemptEnd.signal,
       );
 
@@ -1041,6 +1046,7 @@ export class TargetExecutor implements SerialHost {
         registered.fixtures,
         fixtures,
         this.target.engine?.name ?? 'none',
+        attemptAbort.signal,
       );
 
       /**
@@ -1071,19 +1077,21 @@ export class TargetExecutor implements SerialHost {
         try {
           enter('beforeEach');
           await extended.setUp();
+          attemptAbort.signal.throwIfAborted();
           for (const hook of beforeEachHooks) {
             await hook.fn(fixtures);
+            attemptAbort.signal.throwIfAborted();
           }
           enter('body');
           await (registered.fn as SetupFn)(fixtures);
         } catch (cause) {
           // The body's own failure stays the verdict; the step it abandoned
-          // and the soft failures it kept are noted beside it. A skip keeps
-          // only the soft failures: a step or poll it left running is not one.
+          // and the soft failures it kept are noted beside it. A skip leaves
+          // its soft failures to be settled after the race, and a step or
+          // poll it left running is not one.
           const notAwaited = await abandonNotAwaited();
-          const softFailure = soft.close();
-          const kept = isRuntimeSkip(cause) ? [softFailure] : [...notAwaited, softFailure];
-          for (const secondary of kept) {
+          if (isRuntimeSkip(cause)) throw cause;
+          for (const secondary of [...notAwaited, soft.close()]) {
             if (secondary !== undefined) {
               secondaryErrors.push(serializeError(secondary, { phase: 'body', projectRoot: this.config.projectRoot, redact }));
             }
@@ -1111,7 +1119,7 @@ export class TargetExecutor implements SerialHost {
         ? withAbort(
             runInPollScope(bodyPolls, mainWork),
             this.interruptSignal,
-            () => new E2EError('interrupted', 'INTERRUPTED', `run interrupted in phase ${phase}`),
+            () => new E2EError('interrupted', 'INTERRUPTED', interruptedInPhase(this.interruptSignal, phase)),
           )
         : runInPollScope(bodyPolls, mainWork);
       const body = Promise.race([
@@ -1153,12 +1161,15 @@ export class TargetExecutor implements SerialHost {
       // the next turn of the event loop; waiting that turn out lands it on
       // this attempt instead of between two.
       await new Promise<void>((resolve) => setImmediate(resolve));
-      // A body that timed out or was interrupted never closed its soft
-      // failures; they are noted here so teardown starts with the collection
-      // closed either way, and a soft matcher in a hook throws.
+      // A body that skipped itself, timed out, or was interrupted never
+      // closed its soft failures; they are settled here so teardown starts
+      // with the collection closed either way, and a soft matcher in a hook
+      // throws. A soft failure is sticky: it fails an attempt that then
+      // skipped, and sits beside a timeout or interrupt that came first.
       const lateSoft = soft.close();
       if (lateSoft !== undefined) {
-        secondaryErrors.push(serializeError(lateSoft, { phase: 'body', projectRoot: this.config.projectRoot, redact }));
+        recordFailure(lateSoft, 'body');
+        await captureEvidence();
       }
       // A callback the surface ran for the body (a request interceptor, a
       // dialog handler) fails on a path no step awaits; one that failed after
@@ -1215,6 +1226,8 @@ export class TargetExecutor implements SerialHost {
       } else {
         record.status = classifyAttemptStatus(failure, timedOut, this.interruptSignal.aborted);
         record.error = serializeError(failure, { phase: failurePhase ?? phase, projectRoot: this.config.projectRoot, redact });
+        // A failure outranks the skip; the reason stays beside it.
+        if (skipped !== undefined) record.skip = { cause: 'explicit', reason: skipped.reason };
         // A failure that first landed in teardown has had no look yet.
         await captureEvidence();
       }
@@ -1268,8 +1281,8 @@ export class TargetExecutor implements SerialHost {
  * timeout that had already fired: the attempt then timed out, whatever
  * arrived after.
  */
-function classifyAttemptStatus(
-  failure: E2EError,
+export function classifyAttemptStatus(
+  failure: { readonly code: string },
   timedOut: boolean,
   interrupted: boolean,
 ): 'failed' | 'timed-out' | 'interrupted' {

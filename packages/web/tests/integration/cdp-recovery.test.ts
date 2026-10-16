@@ -136,6 +136,40 @@ describe('CDP session recovery', () => {
     }
   }, 60_000);
 
+  it('emulates the configured and requested media on the persistent page, after reconnect too', async () => {
+    const remote = await host();
+    const engine = await start(
+      { cdpEndpoint: () => remote.endpoint, reconnectEndpoint: () => remote.endpoint },
+      { colorScheme: 'dark' },
+    );
+    const media = () => surfaceOf(engine)!.page().evaluate(() => ({
+      dark: matchMedia('(prefers-color-scheme: dark)').matches,
+      reduce: matchMedia('(prefers-reduced-motion: reduce)').matches,
+    }));
+    try {
+      await fixtureOf(engine).emulateMedia({ reducedMotion: 'reduce' });
+      expect(await media()).toEqual({ dark: true, reduce: true });
+      const live = surfaceOf(engine)!;
+      const [popup] = await Promise.all([
+        live.context().waitForEvent('page'),
+        live.page().evaluate(() => { window.open('/'); }),
+      ]);
+      await popup.waitForLoadState('load');
+      const popupReduced = () => popup.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches);
+      expect(await popupReduced()).toBe(true);
+      await live.context().browser()!.close();
+      expect((await engine.locate!(heading, operation()))[0]?.name).toBe('Login');
+      expect(await media()).toEqual({ dark: true, reduce: true });
+      // The app's own tab outlives the transport, and the new one emulates on it again.
+      const reopened = surfaceOf(engine)!.context().pages().find((page) => page.url().endsWith('/') && page !== surfaceOf(engine)!.page());
+      expect(reopened).toBeDefined();
+      expect(await reopened!.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches)).toBe(true);
+    } finally {
+      await engine.dispose!(cleanup());
+      await closeRemoteChrome(remote);
+    }
+  }, 60_000);
+
   it('runs configured and test init scripts once per document, after reconnect too', async () => {
     const remote = await host();
     const engine = await start(

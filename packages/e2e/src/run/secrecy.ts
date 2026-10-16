@@ -52,6 +52,15 @@ export class SecretExposure {
 }
 
 /**
+ * Whether captured pixels are proven redacted: the engine masked at least as
+ * many regions as the secure nodes it observed. Pixels that are not leave no
+ * session, whoever asked for them.
+ */
+export function pixelsProvenMasked(redaction: { readonly secureNodeCount: number; readonly maskedRegionCount: number }): boolean {
+  return redaction.maskedRegionCount >= redaction.secureNodeCount;
+}
+
+/**
  * Whether a text-like download of the session is rewritten through its
  * ledger before it is kept: whenever the ledger holds a value, filled or
  * not. A value reaches the app in ways the runner never sees (a URL or a

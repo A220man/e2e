@@ -142,6 +142,7 @@
                 },
                 "cache": {
                   "mode": "missed",
+                  "recordedBy": { "provider": "example", "model": "model-A" },
                   "reason": "gap",
                   "derived": "minted-token",
                   "replayedActions": 0,

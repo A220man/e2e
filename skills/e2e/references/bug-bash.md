@@ -5,6 +5,17 @@ verification pass that turns every claimed bug into a repro test that fails
 for the reason reported. Plan the charters, fan them out, merge the findings,
 prove each bug. Report confirmed bugs only, each with its failing test.
 
+## Contents
+
+- 1. Prepare
+- 2. Plan charters
+- 3. Fan out
+- 4. Merge
+- 5. Triage
+- 6. Verify
+- 7. Report
+- Rules
+
 ## 1. Prepare
 
 - A config with a target and an agent that holds a model (topic `setup`),
@@ -69,7 +80,10 @@ const persona = { model: gateway('openai/gpt-6-luna-fast'), maxSteps: 40, maxMod
 export default {
   ...shared,
   // The project's tests, so a repro can use its setup tests' sessions, plus the repro tests from step 6.
-  tests: [shared.tests ?? 'tests/**/*.e2e.ts', 'tests/bugbash/**/*.e2e.ts'].flat(),
+  tests: [
+    ...[shared.tests ?? 'tests/**/*.e2e.ts'].flat().filter((glob) => !glob.startsWith('!tests/bugbash/')),
+    'tests/bugbash/**/*.e2e.ts',
+  ],
   // The app already runs: no command.
   targets: [{ name: 'web', engine: web(), app: { url: 'http://127.0.0.1:3000' } }],
   retries: 0,

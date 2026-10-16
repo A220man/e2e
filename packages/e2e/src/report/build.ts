@@ -214,7 +214,7 @@ export interface ReportAttempt extends ReportAttemptBase {
   appLog?: readonly AppLogRecord[] | undefined;
   /** What the runner saw when the failure landed; absent on a pass or when nothing could be captured. */
   failure?: FailureEvidence | undefined;
-  /** Why the body skipped itself; present exactly when `status` is `skipped`. */
+  /** Why the body skipped itself; present when `status` is `skipped`, and on an attempt that failed after skipping. */
   skip?: SkipInfo | undefined;
 }
 
@@ -407,10 +407,23 @@ function relativeSource(
   source: { file: string; line: number; column: number } | undefined,
   fallbackFile: string,
 ): ReportSource {
-  if (source === undefined) return { file: fallbackFile, line: 1, column: 1 };
+  return projectSource(config?.projectRoot, source, fallbackFile) ?? { file: fallbackFile, line: 1, column: 1 };
+}
+
+/**
+ * A recorded declaration as the report writes it: project-relative, line and
+ * column at least 1. A file outside the project becomes `fallbackFile`; no
+ * recorded source stays `undefined`.
+ */
+export function projectSource(
+  projectRoot: string | undefined,
+  source: { readonly file: string; readonly line: number; readonly column: number } | undefined,
+  fallbackFile: string,
+): ReportSource | undefined {
+  if (source === undefined) return undefined;
   let file = source.file;
-  if (config !== undefined && path.isAbsolute(file)) {
-    file = projectRelativePath(config.projectRoot, file) ?? fallbackFile;
+  if (projectRoot !== undefined && path.isAbsolute(file)) {
+    file = projectRelativePath(projectRoot, file) ?? fallbackFile;
   }
   if (file.startsWith('/') || /^[A-Za-z]:/.test(file)) {
     file = fallbackFile;
@@ -475,7 +488,7 @@ function serializeSerialMember(member: SerialMemberRecord): ReportSerialMember {
     ...(member.appLog === undefined ? {} : { appLog: member.appLog }),
     error: member.error === undefined ? undefined : serializeErrorRecord(member.error),
     ...(member.failure === undefined ? {} : { failure: member.failure }),
-    skip: member.status === 'skipped' ? member.skip : undefined,
+    ...(member.skip === undefined ? {} : { skip: member.skip }),
     secondaryErrors: member.secondaryErrors.map(serializeErrorRecord),
   };
 }

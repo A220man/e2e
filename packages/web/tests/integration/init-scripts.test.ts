@@ -85,9 +85,10 @@ describe('init scripts', () => {
       "(window.trail ??= []).push('source');",
       { path: 'from-file.js' },
       () => { (window.trail ??= []).push('function'); },
+      { method() { (window.trail ??= []).push('method'); } }.method,
     ];
     await attempt({ initScripts }, async (browser, surface) => {
-      const expected = ['source', 'file', 'function'];
+      const expected = ['source', 'file', 'function', 'method'];
       await browser.goto('/framed');
       expect(await seenAtBoot(browser)).toEqual(expected);
       const frame = surface.requirePage().frames()[1]!;

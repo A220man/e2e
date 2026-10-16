@@ -16,9 +16,13 @@ name: mobile
 # booted device and, when a test fails, runs the failed tests once more with
 # `--last-failed` before the job goes red (agent-device's runtime has episodes
 # of its own on a shared machine, #502). The agentic suite replays the
-# recordings committed under .e2e/cache, read-only in CI, and calls the model
-# for a step with none, so on a pull request it runs for this repository's
-# branches only, and not for Dependabot's, whose runs get no secrets either.
+# recordings committed under .e2e/cache and calls the model for a step with
+# none, so on a pull request it runs for this repository's branches only,
+# and not for Dependabot's, whose runs get no secrets either. Android runs
+# it with `--strict-cache`, the way benchmark.yml runs the web one: a
+# committed recording that no longer replays fails the job as REPLAY_STALE
+# instead of spending model calls on every run. iOS replays leniently until
+# the three scenarios the README names replay on a simulator.
 # The merge queue runs with this repository's secrets, so it runs the agentic
 # suite for every pull request. Both platforms' entries are recorded on a Mac
 # (an iPhone 17 Pro simulator, a 1080x2400 emulator) and committed with the
@@ -134,7 +138,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
           cache: pnpm
@@ -225,7 +229,7 @@ jobs:
       - name: Upload report
         if: ${{ !cancelled() }}
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mobile-benchmark-ios-${{ matrix.suite }}-report
           path: &report-paths |
@@ -236,7 +240,7 @@ jobs:
       - name: Upload artifacts
         if: ${{ failure() }}
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mobile-benchmark-ios-${{ matrix.suite }}
           path: &artifact-paths |
@@ -261,7 +265,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
           cache: pnpm
@@ -303,7 +307,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           E2E_MOBILE_BENCHMARK_ANDROID_APP: ${{ steps.app.outputs.app-path }}
           E2E_MOBILE_BENCHMARK_COMMENT: android${{ matrix.suite == 'agentic' && ' agent' || '' }}
-          E2E_RUN: node node_modules/e2e/dist/cli/bin.js run --target android-emulator ${{ matrix.suite == 'agentic' && '--config e2e.agent.config.ts --output .e2e/agent' || '' }}
+          E2E_RUN: node node_modules/e2e/dist/cli/bin.js run --target android-emulator ${{ matrix.suite == 'agentic' && '--config e2e.agent.config.ts --output .e2e/agent --strict-cache' || '' }}
       - name: Failure screens
         if: ${{ failure() }}
         working-directory: apps/mobile-benchmark
@@ -311,7 +315,7 @@ jobs:
       - name: Upload report
         if: ${{ !cancelled() }}
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mobile-benchmark-android-${{ matrix.suite }}-report
           path: *report-paths
@@ -320,7 +324,7 @@ jobs:
       - name: Upload artifacts
         if: ${{ failure() }}
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mobile-benchmark-android-${{ matrix.suite }}
           path: *artifact-paths
@@ -347,7 +351,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 26
           cache: pnpm
