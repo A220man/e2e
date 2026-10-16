@@ -114,7 +114,7 @@ why: `ACTION_FAILED` (product failure); `STEP_BUDGET_EXHAUSTED`,
 `TEST_SETUP_FAILED`, `AUTOMATION_UNSUPPORTED`, `POLICY_DENIED` (blocked
 from outside);
 `MODEL_OUTPUT_INVALID` (unusable answer), `MODEL_REFUSED` (the model refused
-the prompt; exit 1, one call). Full list: topic debugging.
+the prompt). Full list: topic debugging.
 
 Options:
 

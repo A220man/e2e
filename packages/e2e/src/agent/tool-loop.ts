@@ -298,12 +298,8 @@ class LoopRun {
             this.noticeToolChoiceDowngrade(step);
           },
         });
-        if (isModelRefusal(result) || (this.lastStep !== undefined && isModelRefusal(this.lastStep))) {
-          throw modelRefusalError(
-            isModelRefusal(result) ? result : this.lastStep,
-            { provider: this.model.provider, id: this.model.modelId },
-            `agent.${this.context.step.kind}`,
-          );
+        if (result.finishReason === 'content-filter' && !this.conclusion.concluded()) {
+          throw modelRefusalError({ provider: this.model.provider, id: this.model.modelId }, result.rawFinishReason);
         }
         const continued = this.continueAfterTextReply(result.responseMessages);
         if (continued !== undefined) {
@@ -312,17 +308,9 @@ class LoopRun {
         }
         break;
       } catch (cause) {
-        // Before the tool-choice and overflow retries: a content-filter is
-        // not a missing tool call, and sending the prompt again spends a
-        // call the model will refuse the same way.
         if (isModelRefusal(cause)) {
           this.attachTranscript();
-          throw modelRefusalError(
-            cause,
-            { provider: this.model.provider, id: this.model.modelId },
-            `agent.${this.context.step.kind}`,
-            cause,
-          );
+          throw modelRefusalError({ provider: this.model.provider, id: this.model.modelId }, undefined, cause);
         }
         const shrunk = this.overflowRetry(cause);
         if (shrunk !== undefined) {
