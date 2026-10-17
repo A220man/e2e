@@ -437,8 +437,8 @@ Arguments after `--` go to `e2e run`; the options are in the header of
   interval, `faster`, `slower`, or `same` against `±--threshold`, else
   `unresolved`. Sampling stops once the suite's interval resolves.
 - Counters that should not move within one build: steps, events by kind,
-  observed nodes and bytes, cache modes, model calls and tokens. A change
-  here is exact and needs no statistics.
+  observed nodes and bytes, cache modes, model calls and tokens, run exit
+  code. A change here is exact and needs no statistics.
 
 Runs go with `CI=1`: committed recordings replay read-only, a step with none
 calls the model. A load average above half the cores is warned about; shared
